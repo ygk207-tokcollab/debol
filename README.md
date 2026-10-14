@@ -1,0 +1,251 @@
+# Debol (Telegram Mini App storefront + admin panel)
+
+Telegram Mini App storefront + admin control panel for an Ethiopian children's clothing, shoe and toy
+shop. Cash on delivery only. English only (Amharic was removed; `docs/DATA-AND-MIGRATIONS.md` records
+the V3 migration that dropped the `_am` columns). Prices in ETB. `store_settings.store_name_en` seeds as
+`Debol` in `V4__store_branding.sql`, and the header/favicon/logo mark come from the Debol artwork in
+`frontend/public/`.
+
+Everything documented here was read out of the code in this repository. Where something is missing
+or only half-wired, it is listed under [Not implemented / deviations](#not-implemented--deviations).
+
+## Monorepo layout
+
+```
+kids-store/
+  backend/    Kotlin + Spring Boot 3.5.15 + JPA + Flyway + PostgreSQL (Gradle Kotlin DSL) + Dockerfile
+  frontend/   React 19 + TypeScript + Vite 7 + Tailwind v3 + TanStack Query + RHF/Zod + @tma.js/sdk-react
+  scripts/    acceptance.mjs, capture-api-samples.mjs, run-backend.sh, run-demo.ps1, telegram-stub.mjs
+  docs/       this documentation set + api-samples/ (captured live API responses)
+  data/       uploads/ (product images), backend.log, kidsstore_demo-preseed.dump
+  render.yaml Render blueprint (API on Render, storefront on Cloudflare Pages - docs/DEPLOYMENT.md #10)
+```
+
+There is no `bot/` directory. See the deviation note below.
+
+## What is actually implemented
+
+Storefront (`frontend/src/pages/storefront`, API under `/api/v1`):
+
+- Home (`GET /api/v1/store`): store name/tagline/contact, active banners, categories with real product
+  counts, featured + newest products, collections.
+- Catalog with filters (`GET /api/v1/products`): `category`, `q`, `audience`, `gender`, `size`,
+  `minPrice`, `maxPrice`, `inStock`, `featured`, `sort` (default `newest`), `page`, `pageSize` (default 12).
+- Product page by slug with variants (size + colour + stock), size guides (`GET /api/v1/size-guides`).
+- Guest cart keyed by the `X-Cart-Key` header (`/api/v1/cart/**`), merged into the customer cart after
+  sign-in (`POST /api/v1/me/cart/claim`).
+- Checkout with delivery-zone fee lookup, quote endpoint (`POST /api/v1/checkout/quote`),
+  `expectedTotal` price-change guard, idempotency key replay guard, row-locked stock decrement
+  (`POST /api/v1/checkout`). Only `CASH_ON_DELIVERY` is accepted.
+- Customer identity: Telegram Mini App sign-in via verified `initData` (`POST /api/v1/telegram/auth`),
+  or web phone sign-in proven with an existing order number + receipt token
+  (`POST /api/v1/customers/auth/phone`). No SMS provider exists.
+- Order tracking by order number + public receipt token (`GET /api/v1/orders/track/{orderNumber}`),
+  account page (profile, saved addresses, order history, cancel request).
+
+Admin panel (`frontend/src/pages/admin` at `/admin/*`, API under `/api/v1/admin`):
+
+- Email + BCrypt(12) login, JWT sessions, role-based authorization
+  (`OWNER` / `MANAGER` / `DELIVERY_STAFF`), token version revocation.
+- Dashboard counted from PostgreSQL, order search/detail, status transitions, courier assignment,
+  cash collection, cancellation with optional stock restore.
+- Product list and CRUD, images (URL link + multipart upload), variant stock adjustments,
+  inventory movement history, category CRUD, delivery zones, store settings, administrators, audit log,
+  notification outbox history + retry + manual dispatch, Telegram status/pairing endpoints.
+
+Telegram integration (`backend/src/main/kotlin/com/kidsstore/telegram`):
+
+- `TelegramBotClient` - thin Bot API client (`sendMessage`, `getUpdates`, `answerCallbackQuery`),
+  token read only from `TELEGRAM_BOT_TOKEN`.
+- `PollingWorker` - long-polls for admin pairing (`/start 123456`, `/pair 123456`) and inline order
+  buttons (`confirm:<id>`, `reject:<id>`, `deliver:<id>`); `/start` without a code sends the welcome
+  message with an "Open the store" URL button.
+- `OutboxDispatcher` + `OutboxStateService` - transactional outbox (`notification_outbox` table) with
+  exponential backoff, `locked_until` claim, `RETRY` and `DEAD_LETTER` states.
+- `NotificationService` + `MessageRenderer` - new order, status change, cash collected, cancellation,
+  low/out-of-stock and test messages; idempotency keys prevent duplicate sends.
+
+Data layer:
+
+- 26 tables created by Flyway `V1__baseline_schema.sql`; settings rows + sample catalogue from
+  `V2__configuration_and_sample_catalog.sql`; `V3__age_groups_and_single_language.sql` adds the
+  admin-managed age groups and drops the Amharic columns; `V4__store_branding.sql` renames the shop to
+  Debol. Hibernate runs with `ddl-auto: validate`.
+- Money is `NUMERIC(12,2)` everywhere, formatted with `BigDecimal` (`com.kidsstore.common.Money`).
+
+## Quickstart
+
+Full detail in [docs/SETUP-LOCAL.md](docs/SETUP-LOCAL.md). Short version:
+
+1. PostgreSQL 18 listening on `127.0.0.1:5433`, one login role `kidsstore`, and a database
+   (`kidsstore_dev` for `scripts/run-backend.sh`, `kidsstore_demo` for `scripts/run-demo.ps1`):
+
+   ```bash
+   "C:/Program Files/PostgreSQL/18/bin/createuser.exe" -h 127.0.0.1 -p 5433 -SDR --pwprompt kidsstore
+   "C:/Program Files/PostgreSQL/18/bin/createdb.exe"  -h 127.0.0.1 -p 5433 -O kidsstore kidsstore_dev
+   ```
+
+2. Backend (Java 21, Gradle wrapper 8.13). Migrations run on startup:
+
+   ```bash
+   cd kids-store/backend
+   DB_PASSWORD=... JWT_SECRET=... ADMIN_BOOTSTRAP_EMAIL=you@example.com ADMIN_BOOTSTRAP_PASSWORD=... \
+     ../scripts/run-backend.sh
+   # or from an existing jar:
+   powershell -File kids-store/scripts/run-demo.ps1
+   ```
+
+3. Frontend dev server (proxies `/api` to the backend):
+
+   ```bash
+   cd kids-store/frontend
+   npm install
+   VITE_BACKEND_URL=http://127.0.0.1:8090 npm run dev
+   ```
+
+   `vite.config.ts` defaults the proxy target to `http://127.0.0.1:8090`. If the backend runs on the
+   `SERVER_PORT` default of 8080, either set `VITE_BACKEND_URL=http://127.0.0.1:8080` or start the
+   backend with `SERVER_PORT=8090`. The recorded log (`data/backend.log`) and the acceptance script
+   both use 8090.
+
+4. Bot (optional locally). Start the Bot API stand-in and point the backend at it:
+
+   ```bash
+   cd kids-store/scripts && node telegram-stub.mjs        # listens on 127.0.0.1:9099
+   TELEGRAM_API_BASE_URL=http://127.0.0.1:9099 TELEGRAM_BOT_TOKEN=123456:local-demo-stub-token ...
+   ```
+
+   For real Telegram, set `TELEGRAM_BOT_TOKEN` from @BotFather and leave `TELEGRAM_API_BASE_URL` at
+   its default. See [docs/TELEGRAM-SETUP.md](docs/TELEGRAM-SETUP.md).
+
+## URLs
+
+| What | Where |
+| --- | --- |
+| Storefront | `http://localhost:5173/` (routes `/`, `/products`, `/products/:slug`, `/cart`, `/checkout`, `/order/:orderNumber`, `/track`, `/account`) |
+| Admin panel | `http://localhost:5173/admin/...` (login at `/admin/login`, dashboard at `/admin/dashboard`) |
+| Backend API | `http://127.0.0.1:8080/api/v1` (or `:8090` locally, `SERVER_PORT` controls it) |
+| Health | `GET /actuator/health` (+ `/liveness`, `/readiness`) |
+| OpenAPI | `GET /v3/api-docs`, UI at `/swagger-ui.html` |
+| Uploaded images | `GET /api/v1/media/**` served from `STORAGE_LOCAL_DIR` |
+
+## Logging in as admin
+
+Go to `/admin/login` and use the email/password from `ADMIN_BOOTSTRAP_EMAIL` /
+`ADMIN_BOOTSTRAP_PASSWORD`. `AdminBootstrap` (backend/.../admin/AdminAuthService.kt) creates the first
+`OWNER` account only when the `administrator` table is empty, refuses passwords shorter than 10
+characters, and logs a warning if neither variable is set. Additional administrators are created from
+`POST /api/v1/admin/administrators` (OWNER only). The local demo scripts seed throwaway credentials;
+they are listed in [docs/SETUP-LOCAL.md](docs/SETUP-LOCAL.md) and must never be reused.
+
+`POST /api/v1/admin/auth/dev-login` (returns an OWNER token with no password) is disabled unless
+`DEV_AUTH_ENABLED=true`, and startup is refused if it is enabled under a `prod`/`production` profile.
+No page in the frontend calls it.
+
+## Verification status
+
+What has actually been executed, and where to re-run it:
+
+| Check | Command | Last recorded result |
+| --- | --- | --- |
+| Backend unit + integration tests | `cd backend && ./gradlew --offline test` | 65 tests, 9 classes, 0 failures, 0 errors, 0 skipped (JUnit XML in `backend/build/test-results/test`) against the real `kidsstore_test` database; re-run on 2026-10-14 after the V4 migration |
+| End-to-end acceptance (HTTP + PostgreSQL + stub Telegram) | `node scripts/acceptance.mjs` | 12 of 12 scenarios passed, including the outage/retry path and the "no PAID before cash" rule ([docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)) |
+| Frontend types + production bundle | `cd frontend && npm run build` | `tsc --noEmit` clean, then `vite build` -> 2282 modules, one 773.57 kB JS bundle (226.89 kB gzip) + 35.00 kB CSS, re-run on 2026-10-14 (also clean with `VITE_API_BASE_URL` pointing at a remote origin) |
+| Storefront + admin in a browser | `npm run dev`, then the flows in [docs/SETUP-LOCAL.md](docs/SETUP-LOCAL.md) | Manual pass on 2026-10-12 (English only after the language removal): browse -> variant picker -> cart -> server quote -> COD checkout -> receipt -> guest tracking by link -> account order list. Admin: real email/password login (with `DEV_AUTH_ENABLED=false`; `/admin/auth/dev-login` answers 403 `dev_login_disabled`), dashboard metrics, order moved `PENDING_CONFIRMATION -> CONFIRMED -> PROCESSING -> OUT_FOR_DELIVERY -> DELIVERED`, courier assigned, cash recorded -> `PAID`, inventory adjustment `+5` written to `inventory_movement`, four outbox rows `SENT`, audit list. Re-checked in the browser on 2026-10-14 after the Debol rebrand: storefront header/favicon, category tiles, catalog pills, `?q=` search, product page, admin login and product editor. |
+
+Nothing in this repository generates reviews, ratings, sales counts or dashboard figures from
+constants - every number on the admin screens is read from PostgreSQL through `/api/v1/admin/*`.
+
+## Where the sample catalogue comes from
+
+`backend/src/main/resources/db/migration/V2__configuration_and_sample_catalog.sql` inserts 10
+categories, 14 products, 38 variants, 3 collections, 2 promo banners (all flagged `is_sample = TRUE`)
+plus configuration rows: 1 `store_settings` singleton, 5 `delivery_zone` rows and 5 `size_guide` rows
+(not flagged; those are real configuration, not samples). Prices and stock in that file are
+illustrative. The storefront shows a "Sample catalogue item" badge when `product.isSample` is true.
+`data/kidsstore_demo-preseed.dump` is a **data-only** `pg_dump -Fc` of `kidsstore_demo` taken after an
+acceptance run (it contains an `administrator` row with a demo password hash and `flyway_schema_history`).
+Removal before go-live: [docs/DATA-AND-MIGRATIONS.md](docs/DATA-AND-MIGRATIONS.md).
+
+## Not implemented / deviations
+
+Read this before demoing or deploying.
+
+1. **No separate `bot/` module (deliberate architectural deviation).** The build brief asked for a
+   top-level `bot/` service. The Telegram bot lives in the backend at
+   `backend/src/main/kotlin/com/kidsstore/telegram` instead, so that notification enqueueing joins the
+   *same* database transaction as the order/state change (`NotificationService` is `@Transactional` and
+   is called from inside `CartAndCheckout` / `OrderStatusService`), and so inline button callbacks run
+   through the same `OrderStatusService` state machine and admin-pairing check as the panel. Do not
+   look for, or document, a standalone bot service.
+2. **Only the local storage driver exists.** `STORAGE_DRIVER` is bound in `application.yml` and
+   `AppProperties.Storage`, but no code reads it: `StorageService` always writes to
+   `STORAGE_LOCAL_DIR`, and `WebConfig` always maps `STORAGE_PUBLIC_BASE_URL` to that directory.
+   Setting `STORAGE_DRIVER=s3` changes nothing. An S3/Spaces driver is a comment in `StorageService`.
+3. **Some env vars are configured but not read.** `TELEGRAM_PAIRING_TTL_MINUTES` (pairing expiry is
+   hardcoded to `plusMinutes(15)` in `TelegramPairingService.issueCode`), `TELEGRAM_MAX_ATTEMPTS`
+   (outbox rows get `maxAttempts = 8` in `NotificationService`), `CURRENCY_LABEL` (currency comes from
+   `store_settings.currency`) and `STORAGE_DRIVER` (above). `TELEGRAM_DISPATCH_INTERVAL_MS` does work,
+   through the `@Scheduled` placeholder. Changing the other four has no effect today.
+4. **Dev-auth guard is profile-name based.** `SecurityConfig.devAuthGuard` only refuses startup when an
+   *active profile* is literally `prod` or `production`. Deployments that use other profile names must
+   keep `DEV_AUTH_ENABLED=false` themselves.
+5. **Test coverage is backend-only.** `./gradlew --offline test` runs 65 JUnit 5 tests over 9 classes
+   against the real `kidsstore_test` PostgreSQL database (phone validation, BigDecimal money rounding,
+   initData HMAC verification, order state machine, cash-collection gating, oversell/lock behaviour,
+   idempotency, admin role authorization, outbox retry, age-group catalog filtering). The frontend has no test script
+   (`package.json` defines `dev`, `build`, `preview`, `typecheck`); UI correctness is checked by hand in
+   a browser plus `scripts/acceptance.mjs` ([docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)).
+6. **Cash on delivery only.** `orders.payment_method` has a `CHECK (... = 'CASH_ON_DELIVERY')`
+   constraint, and checkout rejects anything else with `payment_method_unavailable`. No gateway, no
+   refunds (`REFUNDED` is an allowed `payment_status` value but no endpoint sets it).
+7. **Rate limiting is in-process and keyed on `request.remoteAddr`** (`RateLimiter`, fixed 1-minute
+   windows, cleared when >5000 buckets). Behind a reverse proxy every request shares the proxy IP,
+   which will trip limits early; the limiter is also not shared between instances.
+8. **The backend does not serve the SPA.** `WebConfig` only maps `/api/v1/media/**`. `GET /` and
+   client-side routes must be handled by the static host / reverse proxy
+   ([docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
+9. **No `.env` loader.** There is no dotenv dependency in `build.gradle.kts`; Spring reads the
+   environment. Root `.env.example` is documentation: export the values (`set -a; source .env; set +a`)
+   or set them in the platform.
+10. **Containers exist, CI does not.** `backend/Dockerfile` and `render.yaml` are new (section 10 of
+    [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)) and have never been built or deployed from this machine -
+    Docker is not installed here. There is still no compose file and no pipeline config.
+11. **Flyway + PostgreSQL 18.** The recorded startup log shows
+    `Flyway upgrade recommended: PostgreSQL 18.6 is newer than this version of Flyway and support has
+    not been tested` (it still applied V1-V4 successfully). `render.yaml` therefore pins PostgreSQL 17.
+12. **Everything is English-only.** The catalog language columns, the API fields and the UI strings all
+    went in V3 plus the frontend language removal, so Telegram notification bodies, the `message` field
+    of the error envelope, and order-history notes (e.g. `Order placed by customer`) are consistent with
+    the screens. Enum *values* are translated in the frontend through the `status.*` keys; free text from
+    the API is shown as it arrives.
+13. **The admin notification list titles event types with `titleCase()`** (`NEW_ORDER` -> "New Order")
+    instead of locale keys, as does the audit page for actions and actor types.
+14. **One JS bundle.** `vite build` emits a single 773.57 kB chunk (226.89 kB gzip); routes are not
+    lazily imported yet, so the admin panel ships with the storefront.
+
+## Documentation index
+
+| File | Contents |
+| --- | --- |
+| [docs/SETUP-LOCAL.md](docs/SETUP-LOCAL.md) | fresh machine: database, backend, frontend, stub bot |
+| [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | every env var, default, prod requirement, secret flag |
+| [docs/TELEGRAM-SETUP.md](docs/TELEGRAM-SETUP.md) | BotFather, mini app URL, pairing, callbacks, outbox |
+| [docs/DATA-AND-MIGRATIONS.md](docs/DATA-AND-MIGRATIONS.md) | Flyway ownership, resets, sample data removal |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | jar + static build, proxy/HTTPS, rollout, production checklist |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | verified failure modes and what the code does |
+| [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) | the 12 acceptance scenarios and how to run them |
+| [docs/api-samples/*.json](docs/api-samples) | live responses for 19 endpoints, re-captured on 2026-10-14 with `node scripts/capture-api-samples.mjs` |
+
+## Conventions worth knowing before editing
+
+- Entities are written with `open var` on every property: the `kotlin-spring`/`allopen` plugin is not
+  resolvable on the build network, so `open` is explicit (`build.gradle.kts` comment). Kotlin classes
+  that Spring must proxy have to stay `open`.
+- Plugins are applied through `buildscript` + `apply(plugin = ...)` rather than the `plugins {}` DSL,
+  because the Gradle plugin portal is unreachable from the development network; dependencies come from
+  Maven Central.
+- Errors are uniform: `{"error": "<code>", "message": "...", "fields": [...], "requestId": "..."}` via
+  `ApiExceptionHandler`. Never add a stack trace or DB detail to a response.
+- Frontend design/toolchain rules (Tailwind v3 palette, `Price`/`money()` only, strict tsconfig with
+  `noUnusedLocals`) are in `frontend/PAGE_BRIEF.md`.

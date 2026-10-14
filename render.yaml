@@ -1,0 +1,92 @@
+# Render blueprint for Debol: the backend API here, the storefront on Cloudflare Pages.
+#
+# Before the first deploy, replace every `REPLACE-WITH-...` value with your real hostnames.
+# `sync: false` marks an environment variable Render will NOT take from this file: it stays blank
+# in the dashboard and you paste the real secret there once. Never commit those values here.
+# Docs: docs/DEPLOYMENT.md section 10.
+
+services:
+  - type: web
+    name: debol-backend
+    runtime: docker
+    dockerContext: ./backend
+    dockerfilePath: ./backend/Dockerfile
+    # Free instances sleep after inactivity, which stalls Telegram polling and adds a cold start to
+    # the first shopper. Keep a paid plan while the store is live.
+    plan: 0.5c-1g
+    region: singapore
+    healthCheckPath: /actuator/health
+    disk:
+      name: debol-uploads
+      mountPath: /app/data/uploads
+      sizeGB: 1
+    envVars:
+      - key: SPRING_PROFILES_ACTIVE
+        value: prod
+      - key: DEV_AUTH_ENABLED
+        value: "false"
+      - key: DB_HOST
+        fromDatabase:
+          name: debol-postgres
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: debol-postgres
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: debol-postgres
+          property: database
+      - key: DB_USER
+        fromDatabase:
+          name: debol-postgres
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: debol-postgres
+          property: password
+      - key: DB_POOL_MAX
+        value: "10"
+      # Exact Cloudflare Pages origins, comma separated, no trailing slash, no paths.
+      - key: ALLOWED_ORIGINS
+        value: https://REPLACE-WITH-YOUR-PAGES-PROJECT.pages.dev
+      - key: TELEGRAM_ENABLED
+        value: "true"
+      - key: TELEGRAM_API_BASE_URL
+        value: https://api.telegram.org
+      # Exactly ONE instance may poll. Never scale this service above 1 while polling is on.
+      - key: TELEGRAM_POLLING_ENABLED
+        value: "true"
+      - key: TELEGRAM_ENFORCE_CALLBACK_CHAT
+        value: "true"
+      - key: TELEGRAM_ADMIN_CONTACT_PHONE
+        value: "0911526922"
+      # Render forwards from its own proxy, so request.remoteAddr is one shared IP for every visitor.
+      # The defaults (5/min logins, 10/min checkouts) would 429 the whole store within a minute of
+      # real traffic, so they are raised here. Raise further or move the limit to the edge if you
+      # see it binding; the app does not read X-Forwarded-For.
+      - key: LOGIN_ATTEMPTS_PER_MINUTE
+        value: "60"
+      - key: CHECKOUT_ATTEMPTS_PER_MINUTE
+        value: "120"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: JWT_SECRET
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      # AdminBootstrap only reads these while the `administrator` table is empty (first boot).
+      # Paste a real address and a password of 10+ characters, deploy once, then clear them.
+      - key: ADMIN_BOOTSTRAP_EMAIL
+        value: REPLACE-WITH-OWNER-EMAIL
+      - key: ADMIN_BOOTSTRAP_PASSWORD
+        sync: false
+      - key: ADMIN_BOOTSTRAP_NAME
+        value: Store owner
+
+databases:
+  - name: debol-postgres
+    databaseName: debol
+    plan: free
+    # Flyway supports 17; the app's DDL is PostgreSQL 14+ syntax.
+    postgresMajorVersion: "17"

@@ -1,0 +1,56 @@
+# Secrets and local environment
+.env
+.env.*
+*.env
+!.env.example
+*.local.env
+*.pem
+*.key
+
+# Build output
+backend/build/
+backend/out/
+backend/.gradle/
+backend/.kotlin/
+frontend/dist/
+frontend/build/
+frontend/node_modules/
+
+# Generated jars (the Gradle wrapper jar must stay in git - it is not built here)
+backend/*.jar
+!**/gradle/wrapper/gradle-wrapper.jar
+
+# Gradle caches / wrapper download markers
+.gradle/
+**/gradle-app.setting
+**/.gradlerepositories
+**/.gradlerepo/
+
+# Runtime data: uploaded images, logs, database dumps
+data/uploads/
+data/*.dump
+data/*.log
+*.log
+logs/
+
+# Local Telegram Bot API stand-in artifacts (written to the stub's working directory)
+scripts/.telegram-stub-log.jsonl
+.telegram-stub-log.jsonl
+.telegram-stub-offline
+
+# Node
+node_modules/
+npm-debug.log*
+.eslintcache
+
+# IDE / editor
+.idea/
+*.iml
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,7 @@
+build/
+out/
+.gradle/
+.kotlin/
+*.log
+Dockerfile
+.dockerignore
