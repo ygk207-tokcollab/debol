@@ -274,25 +274,35 @@ succeeds with `VITE_API_BASE_URL` set, with that origin appearing once inside `d
 | --- | --- | --- |
 | `frontend/dist` | Cloudflare Pages | static only; no Pages Function, no `/api` proxy |
 | Spring Boot jar in Docker | Render web service | `render.yaml` → `debol-backend` |
-| PostgreSQL 17 | Render Postgres | `render.yaml` → `debol-postgres` |
+| PostgreSQL | Neon (external) | connected by `SPRING_DATASOURCE_URL`; `render.yaml` provisions no database |
 | Uploaded images | Render disk at `/app/data/uploads` | `STORAGE_LOCAL_DIR` is baked into the image |
 | Media files back to browsers | Render `/api/v1/media/**` | `permitAll`, 3600 s cache, rewritten to the API origin by `assetUrl()` |
 
 ### 10.2 Render
 
 1. Push the project to GitHub (Render builds from a repo; a zip cannot be deployed).
-2. Edit `render.yaml` first: replace `REPLACE-WITH-YOUR-PAGES-PROJECT.pages.dev` with the real Pages
-   origin and `REPLACE-WITH-OWNER-EMAIL` with the bootstrap admin address.
-3. Render dashboard → New + → Blueprint → connect the repo. It reads `render.yaml` and offers to create
-   both resources.
-4. Three variables are `sync: false`, so they are deliberately blank in the file: `JWT_SECRET`
-   (>= 32 bytes, e.g. `openssl rand -base64 48`), `TELEGRAM_BOT_TOKEN`, `ADMIN_BOOTSTRAP_PASSWORD`
-   (>= 10 characters). Set them in the service's Environment tab, then redeploy. Never put real values
-   in `render.yaml`.
-5. Watch the first build: `gradlew bootJar` downloads Gradle 8.13 and Maven Central artifacts, so it is
+2. Edit `render.yaml` first: two placeholders remain in the file -
+   `REPLACE-WITH-YOUR-PAGES-PROJECT.pages.dev` (the real Pages origin) and `REPLACE-WITH-OWNER-EMAIL`
+   (the bootstrap admin address). The database URI is *not* in the file; see step 4.
+3. Render dashboard → New + → Blueprint → connect the repo. It reads `render.yaml` and creates the web
+   service only; the database lives outside Render.
+4. `sync: false` marks variables that are deliberately blank in the file, so paste them in the
+   service's Environment tab and redeploy: `JWT_SECRET` (>= 32 bytes, e.g. `openssl rand -base64 48`),
+   `TELEGRAM_BOT_TOKEN`, `ADMIN_BOOTSTRAP_PASSWORD` (>= 10 characters) and `SPRING_DATASOURCE_URL`
+   (the Neon URI). Never put real values in `render.yaml` - that last one contains the database
+   password.
+5. Neon is pasted as one variable, rewritten into query-parameter form. Take Connection Details'
+   **pooled** URI,
+   `postgresql://USER:PASS@ep-xxx-pooler.<region>.aws.neon.tech/<db>?sslmode=require`, and write it as
+   `jdbc:postgresql://ep-xxx-pooler.<region>.aws.neon.tech/<db>?user=USER&password=PASS&sslmode=require`.
+   Do **not** leave the credentials in front of the host: pgjdbc 42.7.11 - the version this build
+   resolves - treats `USER:PASS@ep-xxx…` as the hostname and dies with `UnknownHostException`. Verified
+   locally against the driver jar; `?user=&password=` form connects, `user:pass@host` form does not.
+   URL-encode the password if it contains `&`, `%` or `#`.
+6. Watch the first build: `gradlew bootJar` downloads Gradle 8.13 and Maven Central artifacts, so it is
    slow; then Flyway applies V1-V4 and `AdminBootstrap` creates the OWNER only if `administrator` is
    empty.
-6. Health check is `/actuator/health` → `{"status":"UP"}`. Copy the `*.onrender.com` URL for step 10.3.
+7. Health check is `/actuator/health` → `{"status":"UP"}`. Copy the `*.onrender.com` URL for step 10.3.
 
 Plan notes, all of them real constraints:
 
@@ -304,8 +314,17 @@ Plan notes, all of them real constraints:
   not drop to a non-root `USER`. If Render rejects the `disk:` block on your plan, either upgrade or
   delete it - and then uploaded images disappear on every redeploy, since the container filesystem is
   ephemeral.
-- `plan: free` Postgres is time-limited and has no backups/restore window. Upgrade it before the store
-  takes real orders (`docs/DATA-AND-MIGRATIONS.md` covers `pg_dump`).
+- The database is Neon, so it is not a Render resource and the blueprint does not provision it. Three
+  consequences: put a **pooled** endpoint in `SPRING_DATASOURCE_URL` (the direct one counts every Hikari
+  connection against Neon's limit and `DB_POOL_MAX=10` will hit it sooner); disable or lengthen Neon's
+  autosuspend, because a suspended branch drops the pooled connections the app is still holding; and
+  choose a Neon region next to the Render region (`singapore` ↔ `aws-ap-southeast-1`) since every query
+  crosses clouds. Neon's free tier is not a production database - restore/pit options and the retention
+  window are on the paid plans, and `docs/DATA-AND-MIGRATIONS.md` covers `pg_dump` in the meantime.
+- Because Render's Postgres is no longer used, there is no `databases:` block and no
+  `DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD`. Do not add them back: `SPRING_DATASOURCE_URL` overrides
+  the `application.yml` template wholesale, and a defined-but-empty `DB_USER` resolves to a blank
+  username instead of falling back to the default.
 - One instance only while `TELEGRAM_POLLING_ENABLED=true`. Scaling out needs polling off on all but one
   (and a shared volume for uploads).
 

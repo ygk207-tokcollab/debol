@@ -25,26 +25,30 @@ services:
         value: prod
       - key: DEV_AUTH_ENABLED
         value: "false"
-      - key: DB_HOST
-        fromDatabase:
-          name: debol-postgres
-          property: host
-      - key: DB_PORT
-        fromDatabase:
-          name: debol-postgres
-          property: port
-      - key: DB_NAME
-        fromDatabase:
-          name: debol-postgres
-          property: database
-      - key: DB_USER
-        fromDatabase:
-          name: debol-postgres
-          property: user
-      - key: DB_PASSWORD
-        fromDatabase:
-          name: debol-postgres
-          property: password
+      # Neon instead of Render Postgres, configured as ONE environment variable.
+      #
+      # Why not DB_HOST/DB_PORT/DB_NAME: the `spring.datasource.url` template in application.yml is
+      # built from those and has no place for query parameters, and Neon only accepts TLS. A
+      # `SPRING_DATASOURCE_URL` environment variable overrides the template outright (Spring Boot's
+      # relaxed binding ranks env vars above application.yml), so leave DB_HOST/DB_PORT/DB_NAME/DB_USER/
+      # DB_PASSWORD out entirely - a defined-but-empty DB_USER resolves to a blank username instead of
+      # the template default.
+      #
+      # PASTE FORM - credentials must be QUERY PARAMETERS, not `user:pass@host`. pgjdbc 42.7.11 (the
+      # version this build resolves) does not parse the authority form: it sends
+      # `kidsstore:kidsstore@127.0.0.1` to DNS and fails with UnknownHostException. Verified locally
+      # against the driver jar. So rewrite Neon's Connection Details URI:
+      #   postgresql://USER:PASS@ep-xxx-pooler.REGION.aws.neon.tech/DBNAME?sslmode=require
+      # becomes
+      #   jdbc:postgresql://ep-xxx-pooler.REGION.aws.neon.tech/DBNAME?user=USER&password=PASS&sslmode=require
+      # Use the POOLED endpoint (host contains `-pooler`). URL-encode the password if it contains
+      # `&`, `%` or `#`. Query credentials take precedence over the driver's default user property, so
+      # nothing else has to be set. `sslmode=require` is the minimum; try `verify-full` once it works.
+      # If the pooled endpoint reports server-side prepared statement errors, append `&prepareThreshold=0`.
+      #
+      # This is `sync: false`: the URI carries the database password, so it must never be committed.
+      - key: SPRING_DATASOURCE_URL
+        sync: false
       - key: DB_POOL_MAX
         value: "10"
       # Exact Cloudflare Pages origins, comma separated, no trailing slash, no paths.
@@ -84,9 +88,4 @@ services:
       - key: ADMIN_BOOTSTRAP_NAME
         value: Store owner
 
-databases:
-  - name: debol-postgres
-    databaseName: debol
-    plan: free
-    # Flyway supports 17; the app's DDL is PostgreSQL 14+ syntax.
-    postgresMajorVersion: "17"
+# No `databases:` block: the database is Neon (external), so Render does not provision or wire one.

@@ -27,6 +27,16 @@ bundle, a log line, git, or an API response.
 | `LOG_LEVEL` | `INFO` | Log level for `com.kidsstore` | optional | no |
 | `SQL_LOG_LEVEL` | `WARN` | Log level for `org.hibernate.SQL` | optional | no |
 
+`SPRING_DATASOURCE_URL` overrides the whole datasource - Spring Boot's relaxed binding ranks environment
+variables above `application.yml`. That is what the Render + Neon deployment uses, because the `DB_*`
+template has no place for `?sslmode=require` and Neon only accepts TLS. When it is set, the five `DB_*`
+rows above are ignored, so leave them out entirely rather than defining them empty (an empty `DB_USER`
+resolves to a blank username, not the default). Put Neon's credentials in the URL's query string
+(`…/<db>?user=…&password=…&sslmode=require`) - pgjdbc does not parse the `user:pass@host` form; see
+`docs/DEPLOYMENT.md` step 10.2. `SPRING_DATASOURCE_USERNAME` / `SPRING_DATASOURCE_PASSWORD` are the
+alternative if you would rather keep the password out of the URL; query-string credentials take
+precedence over them either way.
+
 ## Secrets
 
 | Variable | Default | Purpose | Prod | Secret |
