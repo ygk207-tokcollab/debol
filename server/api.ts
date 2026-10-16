@@ -34,6 +34,7 @@ function getCartView(cartKey: string) {
       const unitPrice = matchedVariant.effectivePrice ?? matchedProduct.salePrice ?? matchedProduct.basePrice ?? matchedProduct.price ?? 0;
       const lineTotal = unitPrice * item.quantity;
       subtotal += lineTotal;
+      const primaryImage = (matchedProduct.images || []).find((im) => im.isPrimary) || (matchedProduct.images || [])[0];
       renderedItems.push({
         variantId: matchedVariant.id,
         productId: matchedProduct.id,
@@ -41,10 +42,13 @@ function getCartView(cartKey: string) {
         nameEn: matchedProduct.nameEn,
         sizeLabel: matchedVariant.sizeLabel,
         colorName: matchedVariant.colorName,
+        colorHex: matchedVariant.colorHex ?? null,
         unitPrice,
+        listPrice: matchedProduct.basePrice ?? unitPrice,
         quantity: item.quantity,
         lineTotal,
-        stockAvailable: matchedVariant.stock,
+        stock: matchedVariant.stock,
+        imageUrl: primaryImage ? primaryImage.url : null,
       });
     }
   }
@@ -54,6 +58,158 @@ function getCartView(cartKey: string) {
     items: renderedItems,
     subtotal,
     currency: db.storeSettings.currency || 'ETB',
+  };
+}
+
+// Quote and checkout must price the same basket the same way, so both resolve the zone here.
+// Matching on subCity only when the shopper supplied one keeps Addis Ababa's central/outer zones apart.
+function resolveZone(region?: string, city?: string, subCity?: string) {
+  const zones = db.deliveryZones;
+  return (
+    zones.find((z) => z.region === region && z.city === city && (!subCity || z.subCity === subCity)) ||
+    zones.find((z) => z.region === region && (!subCity || !z.subCity || z.subCity === subCity)) ||
+    zones.find((z) => z.region === region) ||
+    zones[0] || { nameEn: null, fee: 150, freeOver: null, estimatedDays: 2 }
+  );
+}
+
+function deliveryFeeFor(zone: { fee: number; freeOver?: number | null }, subtotal: number) {
+  if (zone.freeOver != null && subtotal >= zone.freeOver) return 0;
+  return zone.fee;
+}
+
+// The storefront reads the flat ProductSummary/ProductDetail DTOs, not the internal domain rows.
+function primaryImageUrl(p: Product): string | null {
+  const images = p.images || [];
+  return (images.find((i) => i.isPrimary) || images[0])?.url ?? null;
+}
+
+function toProductSummary(p: Product) {
+  return {
+    slug: p.slug,
+    nameEn: p.nameEn,
+    categorySlug: p.categorySlug,
+    categoryNameEn: p.categoryNameEn,
+    price: p.basePrice,
+    salePrice: p.salePrice ?? null,
+    currency: p.currency,
+    imageUrl: primaryImageUrl(p),
+    totalStock: p.totalStock,
+    featured: p.featured,
+    sizingSystem: p.sizingSystem,
+    audience: p.audience,
+    gender: p.gender,
+    ageGroups: p.ageGroups || [],
+    createdAt: p.createdAt,
+  };
+}
+
+function toProductDetail(p: Product) {
+  const guide = db.sizeGuides.find((g: any) => g.sizingSystem === p.sizingSystem);
+  return {
+    ...toProductSummary(p),
+    descriptionEn: p.descriptionEn ?? null,
+    images: (p.images || []).map((i) => ({ url: i.url, altEn: i.altEn ?? null })),
+    variants: p.variants.map((v) => ({
+      ...v,
+      colorHex: v.colorHex ?? null,
+      price: v.effectivePrice ?? p.basePrice,
+      available: (v.stock ?? 0) > 0 && v.active !== false,
+    })),
+    isSample: Boolean(p.isSample),
+    status: p.status,
+    sizeGuide: guide ? { titleEn: guide.titleEn, bodyEn: guide.bodyEn ?? null } : null,
+    inStock: p.totalStock > 0,
+  };
+}
+
+const STATUS_FLOW = ['PENDING_CONFIRMATION', 'CONFIRMED', 'PROCESSING', 'OUT_FOR_DELIVERY', 'DELIVERED'];
+
+function allowedTransitions(status: string): string[] {
+  if (status === 'DELIVERED' || status === 'CANCELLED') return [];
+  if (status === 'OUT_FOR_DELIVERY') return ['DELIVERED', 'CANCELLED'];
+  const i = STATUS_FLOW.indexOf(status);
+  if (i === -1) return ['CANCELLED'];
+  return [STATUS_FLOW[i + 1], 'CANCELLED'];
+}
+
+// Track, account and admin all read the flat OrderDetail DTO, not the stored Order row.
+function toOrderDetail(order: Order) {
+  const zone: any = resolveZone(order.region, order.city, order.subCity);
+  const at = (status: string) => order.history?.find((h) => h.toStatus === status)?.at ?? null;
+
+  return {
+    id: order.id,
+    orderNumber: order.orderNumber,
+    status: order.status,
+    paymentStatus: order.paymentStatus,
+    paymentMethod: order.paymentMethod,
+    currency: order.currency,
+    subtotal: order.subtotal,
+    deliveryFee: order.deliveryFee,
+    totalAmount: order.totalAmount,
+    amountCollected: order.amountCollected,
+    customerName: order.customerName,
+    customerPhone: order.customerPhone,
+    city: order.city,
+    region: order.region,
+    itemCount: order.itemCount,
+    placedVia: order.placedVia,
+    cancelRequested: order.cancelRequested,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+
+    allowedStatuses: allowedTransitions(order.status),
+    discountAmount: 0,
+    balanceDue: Math.max(0, order.totalAmount - (order.amountCollected || 0)),
+    dialPhone: order.customerPhone,
+    secondaryPhone: order.secondaryPhone ?? null,
+    telegramUserId: null,
+    subCity: order.subCity ?? null,
+    neighborhood: order.neighborhood ?? null,
+    addressLine: order.addressLine ?? '',
+    deliveryInstructions: order.deliveryInstructions ?? null,
+    preferredDeliveryTime: order.preferredDeliveryTime ?? null,
+    deliveryZoneName: zone?.nameEn ?? null,
+    estimatedDays: zone?.estimatedDays ?? null,
+    courierName: order.courierName ?? null,
+    courierPhone: order.courierPhone ?? null,
+    confirmedAt: at('CONFIRMED'),
+    processingAt: at('PROCESSING'),
+    outForDeliveryAt: at('OUT_FOR_DELIVERY'),
+    deliveredAt: at('DELIVERED'),
+    cancelledAt: order.status === 'CANCELLED' ? order.updatedAt : null,
+    cancelRequestedAt: order.cancelRequested ? order.updatedAt : null,
+    cancellationReason: order.cancelReason ?? null,
+    cancelledBy: null,
+    stockRestored: false,
+    failedDeliveryCount: 0,
+    paymentCollectedAt: order.amountCollected > 0 ? order.updatedAt : null,
+    paymentCollectedBy: null,
+    items: (order.items || []).map((it) => {
+      const product = db.products.find((p) => p.slug === it.productSlug);
+      return {
+        productNameEn: it.nameEn,
+        sizeLabel: it.sizeLabel,
+        colorName: it.colorName,
+        quantity: it.quantity,
+        unitPrice: it.unitPrice,
+        lineTotal: it.lineTotal,
+        productSlug: it.productSlug ?? null,
+        variantId: it.variantId ?? null,
+        imageUrl: product ? primaryImageUrl(product) : null,
+      };
+    }),
+    history: (order.history || []).map((h) => ({
+      fromStatus: h.fromStatus ?? null,
+      toStatus: h.toStatus,
+      note: h.note ?? null,
+      actorType: h.actorType,
+      actor: h.actor ?? null,
+      at: h.at,
+    })),
+    notifications: null,
+    auditTrail: null,
   };
 }
 
@@ -77,9 +233,16 @@ apiRouter.get('/store', (_req: Request, res: Response) => {
       phone: db.storeSettings.contactPhone || '0911526922',
       email: db.storeSettings.contactEmail || 'orders@example.com',
     },
-    categories: db.categories.filter((c) => c.active),
-    featured,
-    newArrivals,
+    categories: db.categories.filter((c) => c.active).map((c) => ({
+      slug: c.slug,
+      nameEn: c.nameEn,
+      descriptionEn: c.descriptionEn ?? null,
+      audience: c.audience,
+      imageUrl: null,
+      productCount: db.products.filter((p) => p.categorySlug === c.slug && p.status === 'PUBLISHED').length,
+    })),
+    featured: featured.map(toProductSummary),
+    newArrivals: newArrivals.map(toProductSummary),
     banners: db.banners,
     collections: db.collections,
   });
@@ -101,7 +264,7 @@ apiRouter.get('/store/settings', (_req: Request, res: Response) => {
 apiRouter.get('/categories', (_req: Request, res: Response) => {
   const categoriesWithCounts = db.categories.map((c) => {
     const productCount = db.products.filter((p) => p.categorySlug === c.slug && p.status === 'PUBLISHED').length;
-    return { ...c, productCount };
+    return { ...c, imageUrl: null, productCount };
   });
   res.json(categoriesWithCounts);
 });
@@ -169,7 +332,7 @@ apiRouter.get('/products', (req: Request, res: Response) => {
   const items = filtered.slice(p * ps, (p + 1) * ps);
 
   res.json({
-    items,
+    items: items.map(toProductSummary),
     page: p,
     pageSize: ps,
     totalPages,
@@ -189,10 +352,8 @@ apiRouter.get('/products/:slug', (req: Request, res: Response) => {
     .slice(0, 4);
 
   res.json({
-    ...product,
-    inStock: product.totalStock > 0,
-    price: product.basePrice,
-    related,
+    ...toProductDetail(product),
+    related: related.map(toProductSummary),
   });
 });
 
@@ -287,23 +448,16 @@ apiRouter.post('/checkout/quote', (req: Request, res: Response) => {
   const { region, city, subCity } = req.body;
   const cart = getCartView(key);
 
-  const matchedZone =
-    db.deliveryZones.find((z) => z.region === region && z.city === city && (!subCity || z.subCity === subCity)) ||
-    db.deliveryZones.find((z) => z.region === region) ||
-    db.deliveryZones[0] ||
-    { fee: 150, freeOver: 3000, estimatedDays: 2 };
-
-  let fee = matchedZone.fee;
-  if (matchedZone.freeOver && cart.subtotal >= matchedZone.freeOver) {
-    fee = 0;
-  }
+  const matchedZone = resolveZone(region, city, subCity);
+  const fee = deliveryFeeFor(matchedZone, cart.subtotal);
 
   res.json({
     subtotal: cart.subtotal,
     deliveryFee: fee,
     total: cart.subtotal + fee,
     currency: cart.currency,
-    estimatedDays: matchedZone.estimatedDays,
+    zoneNameEn: 'nameEn' in matchedZone ? matchedZone.nameEn : null,
+    estimatedDays: matchedZone.estimatedDays ?? null,
   });
 });
 
@@ -317,14 +471,8 @@ apiRouter.post('/checkout', (req: Request, res: Response) => {
   const publicToken = `tok_${Math.random().toString(36).substring(2, 12)}`;
 
   // Find delivery zone fee
-  const matchedZone =
-    db.deliveryZones.find((z) => z.region === body.region && z.city === body.city) ||
-    db.deliveryZones[0] ||
-    { fee: 150, freeOver: 3000 };
-  let deliveryFee = matchedZone.fee;
-  if (matchedZone.freeOver && cart.subtotal >= matchedZone.freeOver) {
-    deliveryFee = 0;
-  }
+  const matchedZone = resolveZone(body.region, body.city, body.subCity);
+  const deliveryFee = deliveryFeeFor(matchedZone, cart.subtotal);
 
   const totalAmount = cart.subtotal + deliveryFee;
 
@@ -377,6 +525,16 @@ apiRouter.post('/checkout', (req: Request, res: Response) => {
     })),
     placedVia: 'WEB',
     cancelRequested: false,
+    history: [
+      {
+        fromStatus: null,
+        toStatus: 'PENDING_CONFIRMATION',
+        note: 'Order placed',
+        actorType: 'CUSTOMER',
+        actor: body.phone || null,
+        at: new Date().toISOString(),
+      },
+    ],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -391,6 +549,7 @@ apiRouter.post('/checkout', (req: Request, res: Response) => {
     orderNumber,
     publicToken,
     status: newOrder.status,
+    paymentStatus: newOrder.paymentStatus,
     paymentMethod: newOrder.paymentMethod,
     currency: newOrder.currency,
     subtotal: newOrder.subtotal,
@@ -401,6 +560,8 @@ apiRouter.post('/checkout', (req: Request, res: Response) => {
     customerPhone: newOrder.customerPhone,
     deliveryAddress: newOrder.deliveryAddress,
     createdAt: newOrder.createdAt,
+    customerSessionToken: null,
+    replayed: false,
   });
 });
 
@@ -413,7 +574,7 @@ apiRouter.get('/orders/track/:orderNumber', (req: Request, res: Response) => {
   }
 
   res.json({
-    order,
+    order: toOrderDetail(order),
     publicToken: order.publicToken,
   });
 });
@@ -532,7 +693,7 @@ apiRouter.get('/me/orders/:id', (req: Request, res: Response) => {
   if (!order) {
     return res.status(404).json({ error: 'not_found', message: 'Order not found' });
   }
-  res.json(order);
+  res.json(toOrderDetail(order));
 });
 
 apiRouter.post('/me/orders/:id/cancel-request', (req: Request, res: Response) => {
@@ -549,20 +710,16 @@ apiRouter.post('/me/orders/:id/cancel-request', (req: Request, res: Response) =>
 // ADMIN AUTH & DASHBOARD
 // -------------------------------------------------------------
 
+// The panel gates each screen on these tokens (see src/state/AdminAuth.tsx PERMISSION).
 const ADMIN_PERMISSIONS = [
-  'CATALOG_READ',
-  'CATALOG_WRITE',
-  'ORDERS_READ',
-  'ORDERS_WRITE',
-  'INVENTORY_READ',
-  'INVENTORY_WRITE',
-  'NOTIFICATIONS_READ',
-  'NOTIFICATIONS_WRITE',
-  'ADMIN_READ',
-  'ADMIN_WRITE',
-  'SETTINGS_READ',
-  'SETTINGS_WRITE',
-  'AUDIT_READ',
+  'dashboard',
+  'products',
+  'orders',
+  'inventory',
+  'settings',
+  'telegram',
+  'administrators',
+  'audit',
 ];
 
 apiRouter.post('/admin/auth/login', (req: Request, res: Response) => {
@@ -901,7 +1058,7 @@ apiRouter.get('/admin/orders/:id', (req: Request, res: Response) => {
   if (!order) {
     return res.status(404).json({ error: 'not_found', message: 'Order not found' });
   }
-  res.json(order);
+  res.json(toOrderDetail(order));
 });
 
 apiRouter.post('/admin/orders/:id/status', (req: Request, res: Response) => {
@@ -909,8 +1066,10 @@ apiRouter.post('/admin/orders/:id/status', (req: Request, res: Response) => {
   const target = req.query.target as any;
   const order = db.orders.find((o) => o.id === id);
   if (order && target) {
+    const from = order.status;
     order.status = target;
     order.updatedAt = new Date().toISOString();
+    order.history.push({ fromStatus: from, toStatus: target, note: null, actorType: 'ADMIN', at: order.updatedAt });
   }
   res.json({
     orderNumber: order?.orderNumber,
@@ -924,9 +1083,11 @@ apiRouter.post('/admin/orders/:id/cancel', (req: Request, res: Response) => {
   const { reason, restoreStock } = req.body;
   const order = db.orders.find((o) => o.id === id);
   if (order) {
+    const from = order.status;
     order.status = 'CANCELLED';
     order.cancelReason = reason;
     order.updatedAt = new Date().toISOString();
+    order.history.push({ fromStatus: from, toStatus: 'CANCELLED', note: reason || null, actorType: 'ADMIN', at: order.updatedAt });
   }
   res.json({
     orderNumber: order?.orderNumber,

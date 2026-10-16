@@ -113,6 +113,15 @@ export interface OrderItem {
   lineTotal: number;
 }
 
+export interface OrderHistoryEvent {
+  fromStatus: string | null;
+  toStatus: string;
+  note?: string | null;
+  actorType: string;
+  actor?: string | null;
+  at: string;
+}
+
 export interface Order {
   id: number;
   orderNumber: string;
@@ -141,6 +150,7 @@ export interface Order {
   placedVia: string;
   cancelRequested: boolean;
   cancelReason?: string;
+  history: OrderHistoryEvent[];
   courierName?: string | null;
   courierPhone?: string | null;
   createdAt: string;
@@ -244,6 +254,25 @@ for (const p of productMap.values()) {
 }
 
 // Convert orders to full Order objects
+const STATUS_CHAIN = ['PENDING_CONFIRMATION', 'CONFIRMED', 'PROCESSING', 'OUT_FOR_DELIVERY', 'DELIVERED'];
+
+// Seeded orders only carry their current status, so replay the chain up to it: the first event lands
+// at createdAt and the last at updatedAt, which is what the admin timeline renders.
+function seedHistory(status: string, createdAt: string, updatedAt: string): OrderHistoryEvent[] {
+  if (status === 'CANCELLED') {
+    return [{ fromStatus: null, toStatus: 'PENDING_CONFIRMATION', note: 'Order placed', actorType: 'SYSTEM', at: createdAt }];
+  }
+  const reached = STATUS_CHAIN.slice(0, Math.max(1, STATUS_CHAIN.indexOf(status) + 1));
+  if (reached.length === 0) return [{ fromStatus: null, toStatus: status, note: 'Order placed', actorType: 'SYSTEM', at: createdAt }];
+  return reached.map((toStatus, i) => ({
+    fromStatus: i === 0 ? null : reached[i - 1],
+    toStatus,
+    note: i === 0 ? 'Order placed' : null,
+    actorType: 'SYSTEM',
+    at: i === 0 ? createdAt : i === reached.length - 1 ? updatedAt : createdAt,
+  }));
+}
+
 let ordersList: Order[] = (initialOrdersJson.items || []).map((o: any, idx: number) => ({
   id: o.id || idx + 1,
   orderNumber: o.orderNumber || `ORD-2026-0000${idx + 1}`,
@@ -280,6 +309,7 @@ let ordersList: Order[] = (initialOrdersJson.items || []).map((o: any, idx: numb
   ],
   placedVia: o.placedVia || 'WEB',
   cancelRequested: Boolean(o.cancelRequested),
+  history: seedHistory(o.status || 'PENDING_CONFIRMATION', o.createdAt || new Date().toISOString(), o.updatedAt || new Date().toISOString()),
   createdAt: o.createdAt || new Date().toISOString(),
   updatedAt: o.updatedAt || new Date().toISOString(),
 }));

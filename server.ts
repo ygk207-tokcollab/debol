@@ -1,3 +1,4 @@
+
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
@@ -17,25 +18,45 @@ async function startServer() {
   app.use(express.json());
 
   // Serve media files if any
-  app.use('/api/v1/media', express.static(path.resolve(__dirname, 'public')));
-  app.use('/media', express.static(path.resolve(__dirname, 'public')));
+  app.use(
+    '/api/v1/media',
+    express.static(path.resolve(__dirname, 'public'))
+  );
+  app.use(
+    '/media',
+    express.static(path.resolve(__dirname, 'public'))
+  );
 
-  // Health check endpoints for Render and monitors
-  app.get('/health', (_req, res) => res.status(200).json({ status: 'UP' }));
-  app.get('/actuator/health', (_req, res) => res.status(200).json({ status: 'UP' }));
+  // Health checks
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'UP' });
+  });
 
-  // Mount API router
+  app.get('/actuator/health', (_req, res) => {
+    res.status(200).json({ status: 'UP' });
+  });
+
+  // API routes
   app.use('/api/v1', apiRouter);
   app.use('/api', apiRouter);
 
-  // Vite middleware in dev or static files in production
   if (process.env.NODE_ENV === 'production') {
+    // Serve the built Vite frontend
     const distPath = path.resolve(__dirname, 'dist');
+
     app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.resolve(distPath, 'index.html'));
+
+    // SPA fallback: supports Express 5 and React Router
+    app.use((_req, res, next) => {
+      res.sendFile(
+        path.resolve(distPath, 'index.html'),
+        (err) => {
+          if (err) next(err);
+        }
+      );
     });
   } else {
+    // Vite development mode
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -43,6 +64,7 @@ async function startServer() {
       },
       appType: 'spa',
     });
+
     app.use(vite.middlewares);
   }
 
