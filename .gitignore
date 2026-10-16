@@ -12,6 +12,7 @@ backend/build/
 backend/out/
 backend/.gradle/
 backend/.kotlin/
+dist/
 frontend/dist/
 frontend/build/
 frontend/node_modules/
