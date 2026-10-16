@@ -41,6 +41,9 @@ scripts/.telegram-stub-log.jsonl
 
 # Node
 node_modules/
+bun.lock*
+yarn.lock
+pnpm-lock.yaml
 npm-debug.log*
 .eslintcache
 
