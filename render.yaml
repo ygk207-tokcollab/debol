@@ -1,91 +1,13 @@
-# Render blueprint for Debol: the backend API here, the storefront on Cloudflare Pages.
-#
-# Before the first deploy, replace every `REPLACE-WITH-...` value with your real hostnames.
-# `sync: false` marks an environment variable Render will NOT take from this file: it stays blank
-# in the dashboard and you paste the real secret there once. Never commit those values here.
-# Docs: docs/DEPLOYMENT.md section 10.
-
 services:
   - type: web
-    name: debol-backend
-    runtime: docker
-    dockerContext: ./backend
-    dockerfilePath: ./backend/Dockerfile
-    # Free instances sleep after inactivity, which stalls Telegram polling and adds a cold start to
-    # the first shopper. Keep a paid plan while the store is live.
-    plan: 0.5c-1g
-    region: singapore
-    healthCheckPath: /actuator/health
-    disk:
-      name: debol-uploads
-      mountPath: /app/data/uploads
-      sizeGB: 1
+    name: debol
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
     envVars:
-      - key: SPRING_PROFILES_ACTIVE
-        value: prod
-      - key: DEV_AUTH_ENABLED
-        value: "false"
-      # Neon instead of Render Postgres, configured as ONE environment variable.
-      #
-      # Why not DB_HOST/DB_PORT/DB_NAME: the `spring.datasource.url` template in application.yml is
-      # built from those and has no place for query parameters, and Neon only accepts TLS. A
-      # `SPRING_DATASOURCE_URL` environment variable overrides the template outright (Spring Boot's
-      # relaxed binding ranks env vars above application.yml), so leave DB_HOST/DB_PORT/DB_NAME/DB_USER/
-      # DB_PASSWORD out entirely - a defined-but-empty DB_USER resolves to a blank username instead of
-      # the template default.
-      #
-      # PASTE FORM - credentials must be QUERY PARAMETERS, not `user:pass@host`. pgjdbc 42.7.11 (the
-      # version this build resolves) does not parse the authority form: it sends
-      # `kidsstore:kidsstore@127.0.0.1` to DNS and fails with UnknownHostException. Verified locally
-      # against the driver jar. So rewrite Neon's Connection Details URI:
-      #   postgresql://USER:PASS@ep-xxx-pooler.REGION.aws.neon.tech/DBNAME?sslmode=require
-      # becomes
-      #   jdbc:postgresql://ep-xxx-pooler.REGION.aws.neon.tech/DBNAME?user=USER&password=PASS&sslmode=require
-      # Use the POOLED endpoint (host contains `-pooler`). URL-encode the password if it contains
-      # `&`, `%` or `#`. Query credentials take precedence over the driver's default user property, so
-      # nothing else has to be set. `sslmode=require` is the minimum; try `verify-full` once it works.
-      # If the pooled endpoint reports server-side prepared statement errors, append `&prepareThreshold=0`.
-      #
-      # This is `sync: false`: the URI carries the database password, so it must never be committed.
-      - key: SPRING_DATASOURCE_URL
-        sync: false
-      - key: DB_POOL_MAX
-        value: "10"
-      # Exact Cloudflare Pages origins, comma separated, no trailing slash, no paths.
-      - key: ALLOWED_ORIGINS
-        value: https://REPLACE-WITH-YOUR-PAGES-PROJECT.pages.dev
-      - key: TELEGRAM_ENABLED
-        value: "true"
-      - key: TELEGRAM_API_BASE_URL
-        value: https://api.telegram.org
-      # Exactly ONE instance may poll. Never scale this service above 1 while polling is on.
-      - key: TELEGRAM_POLLING_ENABLED
-        value: "true"
-      - key: TELEGRAM_ENFORCE_CALLBACK_CHAT
-        value: "true"
-      - key: TELEGRAM_ADMIN_CONTACT_PHONE
-        value: "0911526922"
-      # Render forwards from its own proxy, so request.remoteAddr is one shared IP for every visitor.
-      # The defaults (5/min logins, 10/min checkouts) would 429 the whole store within a minute of
-      # real traffic, so they are raised here. Raise further or move the limit to the edge if you
-      # see it binding; the app does not read X-Forwarded-For.
-      - key: LOGIN_ATTEMPTS_PER_MINUTE
-        value: "60"
-      - key: CHECKOUT_ATTEMPTS_PER_MINUTE
-        value: "120"
-      - key: LOG_LEVEL
-        value: INFO
-      - key: JWT_SECRET
-        sync: false
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      # AdminBootstrap only reads these while the `administrator` table is empty (first boot).
-      # Paste a real address and a password of 10+ characters, deploy once, then clear them.
-      - key: ADMIN_BOOTSTRAP_EMAIL
-        value: REPLACE-WITH-OWNER-EMAIL
-      - key: ADMIN_BOOTSTRAP_PASSWORD
-        sync: false
-      - key: ADMIN_BOOTSTRAP_NAME
-        value: Store owner
-
-# No `databases:` block: the database is Neon (external), so Render does not provision or wire one.
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000

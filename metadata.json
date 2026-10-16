@@ -1,0 +1,8 @@
+{
+  "name": "Debol",
+  "description": "Children's clothing, shoes and toys, delivered across Ethiopia. Cash on delivery.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
