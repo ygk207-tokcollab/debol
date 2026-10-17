@@ -32,6 +32,8 @@ export interface ProductImage {
   url: string;
   altEn?: string;
   isPrimary: boolean;
+  contentType?: string | null;
+  sizeBytes?: number | null;
 }
 
 export interface Product {

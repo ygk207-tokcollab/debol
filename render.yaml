@@ -11,5 +11,19 @@ services:
         value: production
       - key: NPM_CONFIG_PRODUCTION
         value: "false"
+      # Vite 7 needs Node 20.19+/22.12+ and the app is run straight from TypeScript via tsx.
+      # Without a pin Render picks its own default and the build can fail outright.
+      - key: NODE_VERSION
+        value: "22"
       - key: PORT
         value: 10000
+      # Neon pooled connection string. Mark it as a Secret in the dashboard; sync: false means the
+      # blueprint asks for the value instead of storing it in git.
+      - key: DATABASE_URL
+        sync: false
+      # scrypt-hashed onto the owner accounts at boot so a fresh database can be signed into.
+      - key: ADMIN_BOOTSTRAP_PASSWORD
+        sync: false
+      # Optional: only needed if the SPA is hosted somewhere other than this service.
+      - key: ALLOWED_ORIGINS
+        sync: false

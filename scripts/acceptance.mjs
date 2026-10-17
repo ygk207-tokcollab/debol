@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process';
 
 const BASE = process.env.BASE_URL || 'http://127.0.0.1:8090/api/v1';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'owner@kidsstore.test';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'LocalDemo2026pass';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_BOOTSTRAP_PASSWORD || 'LocalDemo2026pass';
 const PSQL = process.env.PSQL || 'C:/Program Files/PostgreSQL/18/bin/psql.exe';
 const db = {
   host: process.env.DB_HOST || '127.0.0.1', port: process.env.DB_PORT || '5433',

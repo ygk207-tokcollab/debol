@@ -1,7 +1,54 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
+import crypto from 'crypto';
+import Busboy from 'busboy';
 import { db, Product, Order } from './data';
+import { dbEnabled, q } from './db';
+import { flushPersist, schedulePersist } from './persist';
+import {
+  bearerToken, createSession, destroySession, devLoginAllowed,
+  hashPassword, isAdminPath, isPublicAdminPath, resolveSession, verifyPassword,
+} from './auth';
 
 export const apiRouter = Router();
+
+// The in-memory objects are the working set; Postgres is written back after each successful mutation.
+apiRouter.use((req: Request, res: Response, next: NextFunction) => {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    res.on('finish', () => {
+      if (res.statusCode < 400) void schedulePersist(db);
+    });
+  }
+  next();
+});
+
+apiRouter.use(async (req: Request, res: Response, next: NextFunction) => {
+  if (!isAdminPath(req.path) || isPublicAdminPath(req.path)) return next();
+  try {
+    const adminId = await resolveSession(bearerToken(req));
+    if (!adminId) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Admin session is required or has expired' });
+    }
+    const admin = db.administrators.find((a) => a.id === adminId);
+    if (!admin || admin.active === false) {
+      return res.status(403).json({ error: 'forbidden', message: 'This administrator account is not active' });
+    }
+    req.admin = admin;
+    return next();
+  } catch (err) {
+    return next(err);
+  }
+});
+
+const UPLOAD_MAX_BYTES = 5 * 1024 * 1024;
+const UPLOAD_TYPES = new Map<string, string>([
+  ['image/jpeg', 'jpg'],
+  ['image/png', 'png'],
+  ['image/webp', 'webp'],
+  ['image/gif', 'gif'],
+]);
+
+/** Holds uploaded bytes when there is no DATABASE_URL, so the dev demo can still serve them. */
+const memoryImages = new Map<string, { content: Buffer; contentType: string }>();
 
 // Helper to get or generate cart key
 function getCartKey(req: Request): string {
@@ -722,17 +769,33 @@ const ADMIN_PERMISSIONS = [
   'audit',
 ];
 
-apiRouter.post('/admin/auth/login', (req: Request, res: Response) => {
-  const { email, password } = req.body;
-  const admin = db.administrators.find((a) => a.email.toLowerCase() === String(email).toLowerCase());
+apiRouter.post('/admin/auth/login', async (req: Request, res: Response) => {
+  const { email, password } = req.body ?? {};
+  const admin = db.administrators.find((a) => a.email?.toLowerCase() === String(email ?? '').toLowerCase());
 
-  // Password validation: allow LocalDemo2026pass or test logins
-  if (!admin || (password && password !== 'LocalDemo2026pass' && password !== 'admin' && !password.includes('pass') && !password.includes('demo') && password.length < 3)) {
+  // A database seeded from the captured API samples has no hashes; until a password is set the
+  // panel stays locked instead of accepting anything the way the mock did.
+  const configured = Boolean(admin?.passwordHash);
+  if (!configured) {
+    const message = process.env.ADMIN_BOOTSTRAP_PASSWORD
+      ? 'Invalid email or password'
+      : 'No administrator password is set. Define ADMIN_BOOTSTRAP_PASSWORD (12+ characters) and restart, or set a password from the administrators screen.';
+    if (!admin) {
+      // Still hash a throwaway value so a missing account and a wrong password cost the same.
+      verifyPassword(String(password ?? ''), hashPassword('timing-equaliser'));
+    }
+    return res.status(admin ? 403 : 401).json({ error: admin ? 'password_not_set' : 'bad_credentials', message });
+  }
+  if (!verifyPassword(String(password ?? ''), admin.passwordHash)) {
     return res.status(401).json({ error: 'bad_credentials', message: 'Invalid email or password' });
   }
+  if (admin.active === false) {
+    return res.status(403).json({ error: 'forbidden', message: 'This administrator account is not active' });
+  }
 
+  const token = await createSession(admin.id);
   res.json({
-    token: 'admin-mock-token-2026',
+    token,
     email: admin.email,
     fullName: admin.fullName,
     role: admin.role || 'OWNER',
@@ -740,28 +803,50 @@ apiRouter.post('/admin/auth/login', (req: Request, res: Response) => {
   });
 });
 
-apiRouter.post('/admin/auth/dev-login', (_req: Request, res: Response) => {
+apiRouter.post('/admin/auth/dev-login', async (req: Request, res: Response) => {
+  if (!devLoginAllowed()) {
+    return res.status(404).json({ error: 'not_found', message: 'Enable ADMIN_DEV_LOGIN=true outside production to use the passwordless login' });
+  }
+  const admin = db.administrators.find((a) => a.email?.toLowerCase() === String(req.body?.email ?? '').toLowerCase())
+    ?? db.administrators.find((a) => a.active !== false);
+  if (!admin) return res.status(404).json({ error: 'not_found', message: 'No administrator account exists' });
+  const token = await createSession(admin.id);
   res.json({
-    token: 'admin-mock-token-2026',
-    email: 'owner@kidsstore.test',
-    fullName: 'Store owner',
-    role: 'OWNER',
+    token,
+    email: admin.email,
+    fullName: admin.fullName,
+    role: admin.role || 'OWNER',
     permissions: ADMIN_PERMISSIONS,
   });
 });
 
-apiRouter.get('/admin/auth/me', (_req: Request, res: Response) => {
+apiRouter.get('/admin/auth/me', (req: Request, res: Response) => {
+  const admin = req.admin!;
   res.json({
-    id: 1,
-    email: 'owner@kidsstore.test',
-    fullName: 'Store owner',
-    role: 'OWNER',
+    id: admin.id,
+    email: admin.email,
+    fullName: admin.fullName,
+    role: admin.role || 'OWNER',
     permissions: ADMIN_PERMISSIONS,
   });
 });
 
-apiRouter.post('/admin/auth/revoke', (_req: Request, res: Response) => {
+apiRouter.post('/admin/auth/revoke', async (req: Request, res: Response) => {
+  await destroySession(bearerToken(req));
   res.json({ ok: true });
+});
+
+/** Signed-in admin sets or resets a password for another administrator. */
+apiRouter.post('/admin/administrators/:id/password', (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const admin = db.administrators.find((a) => a.id === id);
+  const password = String(req.body?.password ?? '');
+  if (!admin) return res.status(404).json({ error: 'not_found', message: 'Administrator not found' });
+  if (password.length < 12) {
+    return res.status(422).json({ error: 'validation_failed', message: 'Password must be at least 12 characters', fields: [{ field: 'password', message: 'Must be at least 12 characters' }] });
+  }
+  admin.passwordHash = hashPassword(password);
+  res.json({ ok: true, id: admin.id, email: admin.email });
 });
 
 apiRouter.get('/admin/dashboard', (_req: Request, res: Response) => {
@@ -987,12 +1072,113 @@ apiRouter.post('/admin/products/:id/images', (req: Request, res: Response) => {
   res.json(newImg);
 });
 
-apiRouter.post('/admin/products/:id/image-upload', (_req: Request, res: Response) => {
-  res.json({
-    uploaded: true,
-    url: '/brand-poster.png',
-    storageKey: 'local-asset',
+/**
+ * Real multipart upload from the browser. Bytes go into product_images.content because Render's
+ * filesystem is recreated on every deploy, so anything written to disk would disappear.
+ */
+apiRouter.post('/admin/products/:id/image-upload', (req: Request, res: Response) => {
+  const product = db.products.find((p) => p.id === Number(req.params.id));
+  if (!product) {
+    return res.status(404).json({ error: 'not_found', message: 'Product not found' });
+  }
+  if (!req.headers['content-type']?.startsWith('multipart/form-data')) {
+    return res.status(415).json({ error: 'unsupported_media_type', message: 'Send the image as multipart/form-data with a "file" field' });
+  }
+
+  const isPrimary = req.query.isPrimary === 'true';
+  const altEn = typeof req.query.altEn === 'string' ? req.query.altEn : null;
+
+  const bb = Busboy({ headers: req.headers, limits: { fileSize: UPLOAD_MAX_BYTES, files: 1 } });
+  let handled = false;
+
+  const fail = (status: number, code: string, message: string) => {
+    if (handled || res.headersSent) return req.resume();
+    handled = true;
+    res.status(status).json({ error: code, message });
+    return undefined;
+  };
+
+  bb.on('file', (_field, file, info) => {
+    const mimetype = String(info.mimeType || '');
+    if (!UPLOAD_TYPES.has(mimetype)) {
+      file.resume();
+      fail(415, 'unsupported_image', 'Only JPEG, PNG, WebP and GIF images are accepted');
+      return;
+    }
+    const chunks: Buffer[] = [];
+    file.on('data', (c: Buffer) => chunks.push(c));
+    file.on('limit', () => fail(413, 'image_too_large', `Images must be ${Math.round(UPLOAD_MAX_BYTES / (1024 * 1024))} MB or smaller`));
+    file.on('end', async () => {
+      if (handled) return;
+      handled = true;
+      const content = Buffer.concat(chunks);
+      if (!content.length) {
+        if (!res.headersSent) res.status(422).json({ error: 'empty_file', message: 'The uploaded file is empty' });
+        return;
+      }
+      const id = BigInt(`${Date.now()}${crypto.randomInt(0, 1000)}`);
+      const url = `/api/v1/media/images/${id}`;
+      if (dbEnabled()) {
+        try {
+          // The product may still be in the write queue from the request that just created it, and
+          // product_images has a foreign key onto it.
+          await flushPersist();
+          await q(
+            `insert into product_images (id, product_id, url, alt_en, is_primary, content, content_type, size_bytes)
+             values ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [id, product.id, url, altEn, isPrimary, content, mimetype, content.length],
+          );
+          if (isPrimary) await q('update product_images set is_primary = false where product_id = $1 and id <> $2', [product.id, id]);
+        } catch (err) {
+          if (!res.headersSent) res.status(500).json({ error: 'storage_failed', message: `Could not store the image: ${(err as Error).message}` });
+          return;
+        }
+      } else {
+        memoryImages.set(String(id), { content, contentType: mimetype });
+      }
+      product.images = product.images || [];
+      if (isPrimary) product.images.forEach((img) => { img.isPrimary = false; });
+      const view = {
+        id: Number(id),
+        url,
+        altEn: altEn ?? undefined,
+        isPrimary,
+        contentType: mimetype,
+        sizeBytes: content.length,
+      };
+      product.images.push(view);
+      res.json({ uploaded: true, image: view, url, storageKey: dbEnabled() ? `postgres:product_images:${id}` : 'memory-only' });
+    });
   });
+
+  bb.on('error', (err: Error) => fail(400, 'upload_failed', `Could not read the upload: ${err.message}`));
+  bb.on('close', () => { if (!handled && !res.headersSent) fail(400, 'no_file', 'No file field was found in the upload'); });
+  req.pipe(bb);
+});
+
+/** Serve uploaded bytes. Public: these URLs are what the storefront <img> tags point at. */
+apiRouter.get('/media/images/:id', async (req: Request, res: Response) => {
+  if (!dbEnabled()) {
+    const cached = memoryImages.get(String(req.params.id));
+    if (!cached) {
+      return res.status(404).json({ error: 'not_found', message: 'Uploads are kept in this process until it restarts; set DATABASE_URL to store them permanently' });
+    }
+    res.setHeader('content-type', cached.contentType);
+    res.setHeader('content-length', String(cached.content.length));
+    return res.end(cached.content);
+  }
+  try {
+    const r = await q('select content, content_type, size_bytes from product_images where id = $1', [req.params.id]);
+    if (!r.rowCount || !r.rows[0].content) {
+      return res.status(404).json({ error: 'not_found', message: 'Image not found' });
+    }
+    res.setHeader('content-type', r.rows[0].content_type || 'application/octet-stream');
+    res.setHeader('content-length', String(r.rows[0].content.length));
+    res.setHeader('cache-control', 'public, max-age=31536000, immutable');
+    return res.end(r.rows[0].content);
+  } catch (err) {
+    return res.status(500).json({ error: 'storage_failed', message: (err as Error).message });
+  }
 });
 
 apiRouter.post('/admin/images/:imageId/primary', (req: Request, res: Response) => {
@@ -1349,28 +1535,37 @@ apiRouter.put('/admin/age-groups/:id', (req: Request, res: Response) => {
 // ADMIN PEOPLE, AUDIT, NOTIFICATIONS, TELEGRAM
 // -------------------------------------------------------------
 
+const publicAdmin = (admin: any) => {
+  if (!admin) return admin;
+  const { passwordHash, ...rest } = admin;
+  return { ...rest, hasPassword: Boolean(passwordHash) };
+};
+
 apiRouter.get('/admin/administrators', (_req: Request, res: Response) => {
-  res.json(db.administrators);
+  res.json(db.administrators.map(publicAdmin));
 });
 
 apiRouter.post('/admin/administrators', (req: Request, res: Response) => {
+  const { password, ...body } = req.body ?? {};
   const newAdmin = {
-    id: db.administrators.length + 1,
-    ...req.body,
+    id: Math.max(0, ...db.administrators.map((a) => a.id)) + 1,
+    ...body,
     active: true,
+    passwordHash: typeof password === 'string' && password.length >= 12 ? hashPassword(password) : null,
     createdAt: new Date().toISOString(),
   };
   db.administrators.push(newAdmin);
-  res.json(newAdmin);
+  res.json(publicAdmin(newAdmin));
 });
 
 apiRouter.put('/admin/administrators/:id', (req: Request, res: Response) => {
   const id = Number(req.params.id);
   const admin = db.administrators.find((a) => a.id === id);
   if (admin) {
-    Object.assign(admin, req.body);
+    const { password: _password, ...body } = req.body ?? {};
+    Object.assign(admin, body);
   }
-  res.json(admin);
+  res.json(publicAdmin(admin));
 });
 
 apiRouter.post('/admin/administrators/:id/revoke', (req: Request, res: Response) => {
@@ -1379,7 +1574,7 @@ apiRouter.post('/admin/administrators/:id/revoke', (req: Request, res: Response)
   if (admin) {
     admin.active = false;
   }
-  res.json(admin);
+  res.json(publicAdmin(admin));
 });
 
 apiRouter.get('/admin/audit', (_req: Request, res: Response) => {
