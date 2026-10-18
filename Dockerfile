@@ -3,7 +3,8 @@ FROM node:22-slim
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --include=dev
+# No --include=dev: everything the build needs is a production dependency (see render.yaml).
+RUN npm ci
 
 # server/data.ts reads docs/api-samples/*.json at startup, and server.ts serves public/ and dist/.
 COPY index.html vite.config.ts tsconfig.json tailwind.config.js postcss.config.js ./

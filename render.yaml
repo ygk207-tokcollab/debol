@@ -3,7 +3,10 @@ services:
     name: debol
     runtime: node
     plan: free
-    buildCommand: npm install --include=dev && npm run build
+    # Everything `npm run build` needs (typescript, vite, tsx and every @types/*) is in
+    # `dependencies`, never `devDependencies`: a build here that omits devDependencies is a normal
+    # thing to happen, and `tsc --noEmit` then fails on the untyped `pg` / `busboy` imports.
+    buildCommand: npm install && npm run build
     startCommand: npm start
     healthCheckPath: /health
     envVars:

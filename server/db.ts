@@ -56,7 +56,7 @@ export function getPool(): Pool {
       connectionTimeoutMillis: 10_000,
       idleTimeoutMillis: 30_000,
     });
-    pool.on('error', (err) => console.error('[db] idle client error', err.message));
+    pool.on('error', (err: Error) => console.error('[db] idle client error', err.message));
   }
   return pool;
 }

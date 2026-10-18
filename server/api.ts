@@ -1098,7 +1098,9 @@ apiRouter.post('/admin/products/:id/image-upload', (req: Request, res: Response)
     return undefined;
   };
 
-  bb.on('file', (_field, file, info) => {
+  // Annotated rather than inferred: if @types/busboy is ever left out of the install (Render does not
+  // always build devDependencies) these four parameters would otherwise fail the build as implicit any.
+  bb.on('file', (_field: string, file: NodeJS.ReadableStream, info: { mimeType?: string }) => {
     const mimetype = String(info.mimeType || '');
     if (!UPLOAD_TYPES.has(mimetype)) {
       file.resume();

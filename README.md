@@ -172,6 +172,16 @@ Two constraints to keep on Render:
   (`DB_CONNECT_ATTEMPTS`, default 5 with backoff) is what carries it through Neon accepting connections
   late. Writes are flushed on `SIGTERM`, so a deploy does not lose the last mutation.
 
+### If the build fails with TS7016 on `pg` or `busboy`
+
+`npm run build` runs `tsc --noEmit`, so it needs type declarations, and Render's installer does not
+always build `devDependencies` (a first deploy failed exactly that way). Every package the build reads -
+`typescript`, `vite`, `tsx`, all of the `@types/*` - therefore lives in **`dependencies`**, which is why
+`devDependencies` is absent from `package.json`. Keep it that way when adding a dependency: a build-only
+type package in `devDependencies` is a deploy failure waiting to happen. If a service was created as a
+plain Web Service rather than from `render.yaml`, check its dashboard build command is
+`npm install && npm run build` and that `NODE_ENV` is set to `production`.
+
 ## Legacy Kotlin/Spring stack (reference only)
 
 The guides below describe the production Kotlin/Spring + PostgreSQL stack, whose source is not in this
@@ -251,7 +261,8 @@ What has actually been executed, and where to re-run it:
 | Check | Command | Last recorded result |
 | --- | --- | --- |
 | **This checkout**: types + production bundle | `npm run typecheck`, `npm run build` | `tsc --noEmit` clean and `vite build` succeeded on 2026-10-16 after the Postgres/auth/upload work: 2296 modules, one 773.89 kB JS bundle (227.00 kB gzip) + 35.00 kB CSS |
-| **This checkout**: Postgres persistence, upload and auth end to end | `DATABASE_URL=... PORT=3210 node scripts/e2e-postgres.mjs` | 36 of 36 on 2026-10-16 against a scratch local PostgreSQL 18 database: 401 without a token, wrong/unknown password rejected, dev-login 404 in production, forged token 401, no hash in the administrator list, product created, 382,856-byte PNG uploaded and served back byte-identical, non-image refused with 415, cart -> quote -> COD checkout, order moved to `CONFIRMED`, then the process was killed and restarted: hydrated 22 products, product, **image bytes**, order, status, 2 history events, line item and stock 5 -> all present |
+| **This checkout**: build with no `devDependencies` (the Render failure) | `rm -rf node_modules && NODE_ENV=production npm install && npm run build` | The first Render deploy failed with six errors (`TS7016` for `pg`/`busboy`, four cascading `TS7006`) because `@types/busboy` and `@types/pg` were in `devDependencies`. Reproduced locally by deleting those two packages from `node_modules` - same six errors, same line numbers - then moved both into `dependencies` and annotated the four callbacks. Re-run above on 2026-10-18: install with `NODE_ENV=production`, build clean |
+| **This checkout**: Postgres persistence, upload and auth end to end | `DATABASE_URL=... PORT=3210 node scripts/e2e-postgres.mjs` | 36 of 36 on 2026-10-16 against a scratch local PostgreSQL 18 database, re-run 36 of 36 on 2026-10-18: 401 without a token, wrong/unknown password rejected, dev-login 404 in production, forged token 401, no hash in the administrator list, product created, 382,856-byte PNG uploaded and served back byte-identical, non-image refused with 415, cart -> quote -> COD checkout, order moved to `CONFIRMED`, then the process was killed and restarted: hydrated 22 products, product, **image bytes**, order, status, 2 history events, line item and stock 5 -> all present |
 | **This checkout**: connection-string handling | `node -e` over `poolConfig` cases in `server/db.ts` | 10 of 10 on 2026-10-16: Neon `?sslmode=require&channel_binding=require` -> TLS without chain verification and both libpq-only params stripped; `verify-full` -> verified; `sslmode=disable` -> off; bare `*.neon.tech` -> TLS inferred; bare `127.0.0.1` -> off; `DB_SSL`/`DB_SSL_VERIFY` overrides win |
 | **This checkout**: memory-only mode (no `DATABASE_URL`) | `PORT=3213 npx tsx server.ts` + curl | health reports `memory-only`; `/store` serves 11 categories; login with `ADMIN_BOOTSTRAP_PASSWORD` then `/admin/products` 200 (401 without a token, 403 for a password-less account, 401 for a wrong one); product created; image uploaded and served byte-identical from RAM; `README.md` upload refused with 415 |
 | Backend unit + integration tests | `cd backend && ./gradlew --offline test` | 65 tests, 9 classes, 0 failures, 0 errors, 0 skipped (JUnit XML in `backend/build/test-results/test`) against the real `kidsstore_test` database; re-run on 2026-10-14 after the V4 migration. **Source not in this tree** |
