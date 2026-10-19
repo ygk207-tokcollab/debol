@@ -197,6 +197,22 @@ async function main() {
   const move = await call(`/admin/orders/${orderId}/status?target=CONFIRMED`, { token, method: 'POST', body: { note: 'e2e' } });
   check('order status changed', move.status === 200 && move.data?.status === 'CONFIRMED', JSON.stringify(move.data).slice(0, 120));
 
+  // ---- customer side: the phone that ordered signs in and edits its own account ----
+  const cust = await call('/customers/auth/phone', { method: 'POST', body: { phone: '0911000111' } });
+  const custToken = cust.data?.token;
+  check('customer sign-in issued an unguessable session', cust.status === 200 && /^cust_[0-9a-f]{48}$/.test(String(custToken)), JSON.stringify(cust.data?.profile).slice(0, 120));
+  const myOrders = await call('/me/orders', { token: custToken });
+  check('the buyer sees the order they placed', myOrders.data?.length === 1 && myOrders.data[0].summary.customerPhone === '0911000111', JSON.stringify((myOrders.data || []).map((e) => e.summary.orderNumber)));
+  const custSave = await call('/me/profile', { token: custToken, method: 'PATCH', body: { fullName: 'E2E Buyer', secondaryPhone: '0922000333' } });
+  check('profile write accepted', custSave.status === 200 && custSave.data?.fullName === 'E2E Buyer', JSON.stringify(custSave.data).slice(0, 120));
+  const custAddr = await call('/me/addresses', { token: custToken, method: 'POST', body: { label: 'Home', region: 'Addis Ababa', city: 'Addis Ababa', addressLine: 'House 9' } });
+  check('address saved as the default', custAddr.status === 200 && custAddr.data?.isDefault === true, JSON.stringify(custAddr.data).slice(0, 140));
+  const stranger = await call('/customers/auth/phone', { method: 'POST', body: { phone: '0933000444' } });
+  const strangerOrders = await call('/me/orders', { token: stranger.data?.token });
+  check("another phone's account sees no orders", strangerOrders.status === 200 && strangerOrders.data?.length === 0, JSON.stringify(strangerOrders.data).slice(0, 80));
+  const strangerRead = await call(`/me/orders/${orderId}`, { token: stranger.data?.token });
+  check("another phone can't open that order by id", strangerRead.status === 404, `status=${strangerRead.status}`);
+
   await new Promise((r) => setTimeout(r, 1500));
   await stop(child);
 
@@ -226,6 +242,15 @@ async function main() {
   check('order status survived the restart', afterOrder.data?.status === 'CONFIRMED', afterOrder.data?.status);
   check('order history survived', (afterOrder.data?.history ?? []).length >= 2, `events=${(afterOrder.data?.history ?? []).length}`);
   check('order line items survived', (afterOrder.data?.items ?? []).length === 1 && afterOrder.data.items[0].quantity === 2, JSON.stringify(afterOrder.data?.items)?.slice(0, 160));
+
+  const relogin = await call('/customers/auth/phone', { method: 'POST', body: { phone: '0911000111' } });
+  check('the customer profile survived the restart', relogin.data?.profile?.fullName === 'E2E Buyer' && relogin.data?.profile?.secondaryPhone === '0922000333', JSON.stringify(relogin.data?.profile).slice(0, 160));
+  const addressesAfter = await call('/me/addresses', { token: relogin.data?.token });
+  check('the saved address survived the restart', addressesAfter.data?.length === 1 && addressesAfter.data[0].addressLine === 'House 9', JSON.stringify(addressesAfter.data).slice(0, 160));
+  const ordersAfter = await call('/me/orders', { token: relogin.data?.token });
+  check('the account still sees only its own order', ordersAfter.data?.length === 1 && ordersAfter.data[0].summary.status === 'CONFIRMED', JSON.stringify(ordersAfter.data?.[0]?.summary?.status));
+  const retiredToken = await call('/me/profile', { token: custToken });
+  check('re-login retired the pre-restart customer token', retiredToken.status === 401, `status=${retiredToken.status}`);
 
   const stockAfter = await call(`/products/${found?.slug}`, {});
   check('stock decremented and persisted', stockAfter.data?.variants?.[0]?.stock === 5, `stock=${stockAfter.data?.variants?.[0]?.stock}`);

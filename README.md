@@ -41,16 +41,22 @@ Storefront (`src/pages/storefront`, API under `/api/v1`):
 - Catalog with filters (`GET /api/v1/products`): `category`, `q`, `audience`, `gender`, `size`,
   `minPrice`, `maxPrice`, `inStock`, `featured`, `sort` (default `newest`), `page`, `pageSize` (default 12).
 - Product page by slug with variants (size + colour + stock), size guides (`GET /api/v1/size-guides`).
-- Guest cart keyed by the `X-Cart-Key` header (`/api/v1/cart/**`), merged into the customer cart after
-  sign-in (`POST /api/v1/me/cart/claim`).
+- Guest cart keyed by the `X-Cart-Key` header (`/api/v1/cart/**`), kept as-is across sign-in
+  (`POST /api/v1/me/cart/claim` is a no-op: the SPA sends the same key before and after, so there is
+  nothing to merge).
 - Checkout with delivery-zone fee lookup, quote endpoint (`POST /api/v1/checkout/quote`),
   `expectedTotal` price-change guard, idempotency key replay guard, row-locked stock decrement
   (`POST /api/v1/checkout`). Only `CASH_ON_DELIVERY` is accepted.
-- Customer identity: Telegram Mini App sign-in via verified `initData` (`POST /api/v1/telegram/auth`),
-  or web phone sign-in proven with an existing order number + receipt token
-  (`POST /api/v1/customers/auth/phone`). No SMS provider exists.
-- Order tracking by order number + public receipt token (`GET /api/v1/orders/track/{orderNumber}`),
-  account page (profile, saved addresses, order history, cancel request).
+- Customer identity: phone sign-in mints a random bearer session (`POST /api/v1/customers/auth/phone`)
+  and the phone *is* the credential - anyone who knows a number can open that account, because no SMS
+  provider exists to prove ownership. Signing in again reuses that phone's profile and retires its older
+  session; signing out kills the presented token but keeps the profile, keyed under an unguessable string.
+  `POST /api/v1/telegram/auth` reads the name out of Telegram `initData` but cannot verify the signature
+  (no `TELEGRAM_BOT_TOKEN` is configured), so such a session starts with no phone.
+- Every `/me/**` screen resolves the bearer token: profile reads and writes the stored customer, saved
+  addresses live inside the persisted profile row, and the order list, order detail and cancel request
+  only see orders whose `customerPhone` matches the signed-in phone.
+- Order tracking by order number + public receipt token (`GET /api/v1/orders/track/{orderNumber}`).
 
 Admin panel (`src/pages/admin` at `/admin/*`, API under `/api/v1/admin`):
 
@@ -142,8 +148,19 @@ it refuses names that don't look like `test|scratch|demo|tmp` unless `E2E_ALLOW_
 DATABASE_URL=postgres://... PORT=3210 ADMIN_BOOTSTRAP_PASSWORD=... node scripts/e2e-postgres.mjs
 ```
 
-36 checks: auth, upload byte-for-byte round-trip, checkout, then a **restart** and re-read of the product,
-its image bytes, the order, its status, history and remaining stock.
+46 checks: auth, upload byte-for-byte round-trip, checkout, a customer signing in as the phone that
+ordered (profile write, saved address, and a second phone getting 404 on that order), then a **restart**
+and re-read of the product, its image bytes, the order, its status, history, remaining stock and the
+customer's own profile and address.
+
+The customer side has its own suite, and it needs no database:
+
+```bash
+PORT=3216 node scripts/e2e-customer.mjs
+```
+
+43 checks: unguessable session token, the profile form really writing and reading back, sign-out keeping
+the account, saved addresses, and a second customer being unable to read or cancel the first one's orders.
 
 ## Deploying to Render
 
@@ -260,11 +277,12 @@ What has actually been executed, and where to re-run it:
 
 | Check | Command | Last recorded result |
 | --- | --- | --- |
-| **This checkout**: types + production bundle | `npm run typecheck`, `npm run build` | `tsc --noEmit` clean and `vite build` succeeded on 2026-10-16 after the Postgres/auth/upload work: 2296 modules, one 773.89 kB JS bundle (227.00 kB gzip) + 35.00 kB CSS |
+| **This checkout**: types + production bundle | `npm run typecheck`, `npm run build` | `tsc --noEmit` clean and `vite build` succeeded on 2026-10-18 after the customer-account work: 2296 modules, one 773.89 kB JS bundle (227.00 kB gzip) + 35.00 kB CSS |
 | **This checkout**: build with no `devDependencies` (the Render failure) | `rm -rf node_modules && NODE_ENV=production npm install && npm run build` | The first Render deploy failed with six errors (`TS7016` for `pg`/`busboy`, four cascading `TS7006`) because `@types/busboy` and `@types/pg` were in `devDependencies`. Reproduced locally by deleting those two packages from `node_modules` - same six errors, same line numbers - then moved both into `dependencies` and annotated the four callbacks. Re-run above on 2026-10-18: install with `NODE_ENV=production`, build clean |
-| **This checkout**: Postgres persistence, upload and auth end to end | `DATABASE_URL=... PORT=3210 node scripts/e2e-postgres.mjs` | 36 of 36 on 2026-10-16 against a scratch local PostgreSQL 18 database, re-run 36 of 36 on 2026-10-18: 401 without a token, wrong/unknown password rejected, dev-login 404 in production, forged token 401, no hash in the administrator list, product created, 382,856-byte PNG uploaded and served back byte-identical, non-image refused with 415, cart -> quote -> COD checkout, order moved to `CONFIRMED`, then the process was killed and restarted: hydrated 22 products, product, **image bytes**, order, status, 2 history events, line item and stock 5 -> all present |
+| **This checkout**: Postgres persistence, upload, auth and the customer account end to end | `DATABASE_URL=... PORT=3210 node scripts/e2e-postgres.mjs` | 46 of 46 on 2026-10-18 against a scratch local PostgreSQL 18 cluster (`postgres://kidsstore@127.0.0.1:5455/debol_test`): 401 without a token, wrong/unknown password rejected, dev-login 404 in production, forged token 401, no hash in the administrator list, product created, 382,856-byte PNG uploaded and served back byte-identical, non-image refused with 415, cart -> quote -> COD checkout, order moved to `CONFIRMED`, customer sign-in as the order's phone (unguessable `cust_<48 hex>`, profile write, address saved, a second phone gets 404 on that order), then the process was killed and restarted: hydrated 22 products and 6 orders, product, **image bytes**, order, status, 2 history events, line item, stock 5, **the customer's name, secondary phone and saved address** -> all present, and the pre-restart customer token was retired by the re-login |
 | **This checkout**: connection-string handling | `node -e` over `poolConfig` cases in `server/db.ts` | 10 of 10 on 2026-10-16: Neon `?sslmode=require&channel_binding=require` -> TLS without chain verification and both libpq-only params stripped; `verify-full` -> verified; `sslmode=disable` -> off; bare `*.neon.tech` -> TLS inferred; bare `127.0.0.1` -> off; `DB_SSL`/`DB_SSL_VERIFY` overrides win |
 | **This checkout**: memory-only mode (no `DATABASE_URL`) | `PORT=3213 npx tsx server.ts` + curl | health reports `memory-only`; `/store` serves 11 categories; login with `ADMIN_BOOTSTRAP_PASSWORD` then `/admin/products` 200 (401 without a token, 403 for a password-less account, 401 for a wrong one); product created; image uploaded and served byte-identical from RAM; `README.md` upload refused with 415 |
+| **This checkout**: customer sessions, profile writes and order privacy | `PORT=3216 node scripts/e2e-customer.mjs` | 43 of 43 on 2026-10-18, no `DATABASE_URL` (the `customer_profiles` round-trip itself is covered by the Postgres run): `POST /customers/auth/phone` returns `cust_<48 hex>` and rejects a 4-digit number; `/me/profile` is 401 without a token and now reflects the signed-in phone, not the seeded person; `PATCH` persists name + secondary phone, refuses an empty name (422) and a phone another account holds (409); addresses save/list/delete with default promotion and are invisible to other customers; `/me/orders*` only return orders placed with the session phone - a second customer gets 404 on another's order and cannot cancel it, while the owner's request records `CUSTOMER` history; re-login reuses the profile and retires the old token, logout revokes the token but keeps the account |
 | Backend unit + integration tests | `cd backend && ./gradlew --offline test` | 65 tests, 9 classes, 0 failures, 0 errors, 0 skipped (JUnit XML in `backend/build/test-results/test`) against the real `kidsstore_test` database; re-run on 2026-10-14 after the V4 migration. **Source not in this tree** |
 | End-to-end acceptance (HTTP + PostgreSQL + stub Telegram) | `node scripts/acceptance.mjs` | 12 of 12 scenarios passed on 2026-10-14 against the Kotlin backend ([docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)). It now reads `ADMIN_PASSWORD`/`ADMIN_BOOTSTRAP_PASSWORD` for sign-in; **not re-run against this Express server on 2026-10-16** |
 | Frontend types + production bundle (Kotlin-era record) | `cd frontend && npm run build` | `tsc --noEmit` clean, then `vite build` -> 2282 modules, one 773.57 kB JS bundle (226.89 kB gzip) + 35.00 kB CSS, re-run on 2026-10-14 (also clean with `VITE_API_BASE_URL` pointing at a remote origin) |

@@ -630,113 +630,269 @@ apiRouter.get('/orders/track/:orderNumber', (req: Request, res: Response) => {
 // CUSTOMER AUTH & ME
 // -------------------------------------------------------------
 
+// The phone is the credential, so a sign-in has to find the profile that already belongs to it
+// instead of handing out a fresh one, and the bearer token the SPA stores decides whose /me/** it is.
+
+const phoneDigits = (value: unknown): string => String(value ?? '').replace(/\D/g, '');
+
+const newCustomerToken = (): string => `cust_${crypto.randomBytes(24).toString('hex')}`;
+
+function profileByPhone(digits: string): any | null {
+  if (!digits) return null;
+  for (const profile of db.customerProfiles.values()) {
+    if (phoneDigits(profile.phone) === digits) return profile;
+  }
+  return null;
+}
+
+function customerSession(req: Request): any | null {
+  const token = bearerToken(req);
+  return token ? db.customerProfiles.get(token) ?? null : null;
+}
+
+const noCustomerSession = (res: Response) =>
+  res.status(401).json({ error: 'unauthorized', message: 'Sign in to see this page' });
+
+const publicProfile = (profile: any) => ({
+  id: profile.id,
+  fullName: profile.fullName ?? '',
+  phone: profile.phone ?? '',
+  secondaryPhone: profile.secondaryPhone ?? null,
+  telegramLinked: Boolean(profile.telegramUserId),
+  currency: profile.currency || db.storeSettings.currency || 'ETB',
+  createdAt: profile.createdAt,
+});
+
+const nextCustomerId = () =>
+  1 + [...db.customerProfiles.values()].reduce((max, p) => Math.max(max, Number(p.id) || 0), 0);
+
+/** One live session per phone: signing in again retires the tokens that carried the same profile. */
+function retireSessionsFor(digits: string): void {
+  if (!digits) return;
+  for (const [key, profile] of [...db.customerProfiles]) {
+    if (phoneDigits(profile.phone) === digits) db.customerProfiles.delete(key);
+  }
+}
+
 apiRouter.post('/customers/auth/phone', (req: Request, res: Response) => {
-  const { phone, fullName } = req.body;
-  const token = `cust_${Buffer.from(phone || 'user').toString('hex')}`;
+  const phone = String(req.body?.phone ?? '').trim();
+  const digits = phoneDigits(phone);
+  if (digits.length < 9) {
+    return res.status(422).json({
+      error: 'validation_failed',
+      message: 'Enter a valid phone number',
+      fields: [{ field: 'phone', message: 'Enter a valid phone number' }],
+    });
+  }
+
+  let profile = profileByPhone(digits);
+  if (profile) {
+    retireSessionsFor(digits);
+  } else {
+    profile = {
+      id: nextCustomerId(),
+      phone,
+      fullName: String(req.body?.fullName ?? '').trim(),
+      secondaryPhone: null,
+      addresses: [],
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  const token = newCustomerToken();
+  db.customerProfiles.set(token, profile);
+  res.json({ token, profile: publicProfile(profile) });
+});
+
+// initData is signed by Telegram and we cannot verify it without the bot token, so this session is
+// created empty: it carries the Telegram name for the badge, and no phone until the customer saves one.
+apiRouter.post('/telegram/auth', (req: Request, res: Response) => {
+  let telegram: { id?: number; first_name?: string; last_name?: string } = {};
+  try {
+    const raw = new URLSearchParams(String(req.body?.initData ?? '')).get('user');
+    if (raw) telegram = JSON.parse(raw);
+  } catch {
+    // Malformed or absent initData still yields a usable, but anonymous, storefront session.
+  }
+
+  const token = newCustomerToken();
   const profile = {
-    id: 1,
-    phone: phone || '0911526922',
-    fullName: fullName || 'Customer',
+    id: nextCustomerId(),
+    phone: '',
+    fullName: [telegram.first_name, telegram.last_name].filter(Boolean).join(' ').trim(),
+    secondaryPhone: null,
+    addresses: [],
+    telegramUserId: telegram.id ?? null,
     createdAt: new Date().toISOString(),
   };
   db.customerProfiles.set(token, profile);
-
-  res.json({ token, profile });
+  res.json({ token, profile: publicProfile(profile) });
 });
 
-apiRouter.post('/telegram/auth', (_req: Request, res: Response) => {
-  const token = `cust_tg_${Math.random().toString(36).substring(2, 10)}`;
-  const profile = {
-    id: 1,
-    phone: '0911526922',
-    fullName: 'Telegram Shopper',
-    telegramUserId: 12345678,
-  };
-  db.customerProfiles.set(token, profile);
-  res.json({ token, profile });
-});
-
-apiRouter.post('/customers/auth/logout', (_req: Request, res: Response) => {
+apiRouter.post('/customers/auth/logout', (req: Request, res: Response) => {
+  const token = bearerToken(req);
+  const profile = token ? db.customerProfiles.get(token) : null;
+  if (profile) {
+    db.customerProfiles.delete(token);
+    // The map key doubles as the session token, so the account is re-keyed under an unguessable
+    // string nobody holds: the presented token dies, but the name and addresses are still there for
+    // the next sign-in (and for the write-back, which keys the row by this same string).
+    db.customerProfiles.set(`acct_${crypto.randomBytes(24).toString('hex')}`, profile);
+  }
   res.json({ ok: true, revoked: true });
 });
 
-apiRouter.get('/me/profile', (_req: Request, res: Response) => {
-  res.json({
-    id: 1,
-    phone: '0911526922',
-    fullName: 'Almaz Tesfaye',
-    createdAt: '2026-10-12T20:38:11.233Z',
-  });
+apiRouter.get('/me/profile', (req: Request, res: Response) => {
+  const profile = customerSession(req);
+  if (!profile) return noCustomerSession(res);
+  res.json(publicProfile(profile));
 });
 
 apiRouter.patch('/me/profile', (req: Request, res: Response) => {
-  const { fullName } = req.body;
-  res.json({
-    id: 1,
-    phone: '0911526922',
-    fullName: fullName || 'Almaz Tesfaye',
-    createdAt: '2026-10-12T20:38:11.233Z',
-  });
+  const profile = customerSession(req);
+  if (!profile) return noCustomerSession(res);
+  const body = req.body ?? {};
+
+  if ('fullName' in body) {
+    const fullName = String(body.fullName ?? '').trim();
+    if (!fullName) {
+      return res.status(422).json({
+        error: 'validation_failed',
+        message: 'Name is required',
+        fields: [{ field: 'fullName', message: 'Enter your name' }],
+      });
+    }
+    profile.fullName = fullName;
+  }
+
+  if ('phone' in body) {
+    const phone = String(body.phone ?? '').trim();
+    const digits = phoneDigits(phone);
+    if (digits.length < 9) {
+      return res.status(422).json({
+        error: 'validation_failed',
+        message: 'Enter a valid phone number',
+        fields: [{ field: 'phone', message: 'Enter a valid phone number' }],
+      });
+    }
+    // The phone signs sessions out, so two accounts cannot claim the same one.
+    const owner = profileByPhone(digits);
+    if (owner && owner !== profile) {
+      return res.status(409).json({
+        error: 'phone_taken',
+        message: 'That phone number belongs to another account',
+        fields: [{ field: 'phone', message: 'Already used by another account' }],
+      });
+    }
+    retireSessionsFor(phoneDigits(profile.phone));
+    profile.phone = phone;
+    db.customerProfiles.set(bearerToken(req), profile);
+  }
+
+  if ('secondaryPhone' in body) {
+    profile.secondaryPhone = body.secondaryPhone ? String(body.secondaryPhone).trim() : null;
+  }
+
+  res.json(publicProfile(profile));
 });
 
-apiRouter.get('/me/addresses', (_req: Request, res: Response) => {
-  res.json([
-    {
-      id: 1,
-      label: 'Home',
-      region: 'Addis Ababa',
-      city: 'Addis Ababa',
-      subCity: 'Bole',
-      neighborhood: 'Bole Medhanialem',
-      addressLine: 'House 12, near Edna Mall',
-      isDefault: true,
-    },
-  ]);
+// Saved addresses have no table of their own; they live inside the profile row that persistence
+// already round-trips, so they survive a restart without a second write path.
+apiRouter.get('/me/addresses', (req: Request, res: Response) => {
+  const profile = customerSession(req);
+  if (!profile) return noCustomerSession(res);
+  res.json(profile.addresses ?? []);
 });
 
 apiRouter.post('/me/addresses', (req: Request, res: Response) => {
-  res.json({
-    id: Date.now(),
-    ...req.body,
-    isDefault: true,
-  });
+  const profile = customerSession(req);
+  if (!profile) return noCustomerSession(res);
+  const body = req.body ?? {};
+  const list = (profile.addresses ||= []);
+
+  const missing = ['region', 'city', 'addressLine'].filter((field) => !String(body[field] ?? '').trim());
+  if (missing.length) {
+    return res.status(422).json({
+      error: 'validation_failed',
+      message: 'Region, city and address are required',
+      fields: missing.map((field) => ({ field, message: 'This field is required' })),
+    });
+  }
+
+  const isDefault = list.length === 0 ? true : Boolean(body.isDefault);
+  if (isDefault) for (const address of list) address.isDefault = false;
+
+  const address = {
+    id: list.length ? Math.max(...list.map((a: any) => Number(a.id) || 0)) + 1 : 1,
+    label: body.label ?? null,
+    region: String(body.region).trim(),
+    city: String(body.city).trim(),
+    subCity: body.subCity ?? null,
+    neighborhood: body.neighborhood ?? null,
+    addressLine: String(body.addressLine).trim(),
+    instructions: body.instructions ?? null,
+    isDefault,
+  };
+  list.push(address);
+  res.json(address);
 });
 
-apiRouter.delete('/me/addresses/:id', (_req: Request, res: Response) => {
+apiRouter.delete('/me/addresses/:id', (req: Request, res: Response) => {
+  const profile = customerSession(req);
+  if (!profile) return noCustomerSession(res);
+  const list = (profile.addresses ||= []);
+  const index = list.findIndex((a: any) => String(a.id) === String(req.params.id));
+  if (index === -1) return res.status(404).json({ error: 'not_found', message: 'Address not found' });
+  const wasDefault = list[index].isDefault;
+  list.splice(index, 1);
+  if (wasDefault && list.length) list[0].isDefault = true;
   res.json({ ok: true });
 });
 
-apiRouter.get('/me/orders', (_req: Request, res: Response) => {
-  const myOrders = db.orders.slice(0, 5).map((o) => ({
-    summary: {
-      id: o.id,
-      orderNumber: o.orderNumber,
-      status: o.status,
-      paymentStatus: o.paymentStatus,
-      paymentMethod: o.paymentMethod,
-      currency: o.currency,
-      subtotal: o.subtotal,
-      deliveryFee: o.deliveryFee,
-      totalAmount: o.totalAmount,
-      amountCollected: o.amountCollected,
-      customerName: o.customerName,
-      customerPhone: o.customerPhone,
-      city: o.city,
-      region: o.region,
-      itemCount: o.itemCount,
-      placedVia: o.placedVia,
-      cancelRequested: o.cancelRequested,
-      createdAt: o.createdAt,
-      updatedAt: o.updatedAt,
-    },
-    publicToken: o.publicToken,
-  }));
-  res.json(myOrders);
+// Orders are matched by the phone they were placed with, so a customer only ever sees their own.
+function ordersForPhone(digits: string): Order[] {
+  if (!digits) return [];
+  return db.orders
+    .filter((o) => phoneDigits(o.customerPhone) === digits)
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+apiRouter.get('/me/orders', (req: Request, res: Response) => {
+  const profile = customerSession(req);
+  if (!profile) return noCustomerSession(res);
+  res.json(
+    ordersForPhone(phoneDigits(profile.phone)).map((o) => ({
+      summary: {
+        id: o.id,
+        orderNumber: o.orderNumber,
+        status: o.status,
+        paymentStatus: o.paymentStatus,
+        paymentMethod: o.paymentMethod,
+        currency: o.currency,
+        subtotal: o.subtotal,
+        deliveryFee: o.deliveryFee,
+        totalAmount: o.totalAmount,
+        amountCollected: o.amountCollected,
+        customerName: o.customerName,
+        customerPhone: o.customerPhone,
+        city: o.city,
+        region: o.region,
+        itemCount: o.itemCount,
+        placedVia: o.placedVia,
+        cancelRequested: o.cancelRequested,
+        createdAt: o.createdAt,
+        updatedAt: o.updatedAt,
+      },
+      publicToken: o.publicToken,
+    })),
+  );
 });
 
 apiRouter.get('/me/orders/:id', (req: Request, res: Response) => {
+  const profile = customerSession(req);
+  if (!profile) return noCustomerSession(res);
   const id = Number(req.params.id);
-  const order = db.orders.find((o) => o.id === id);
+  const order = ordersForPhone(phoneDigits(profile.phone)).find((o) => o.id === id);
   if (!order) {
     return res.status(404).json({ error: 'not_found', message: 'Order not found' });
   }
@@ -744,13 +900,25 @@ apiRouter.get('/me/orders/:id', (req: Request, res: Response) => {
 });
 
 apiRouter.post('/me/orders/:id/cancel-request', (req: Request, res: Response) => {
+  const profile = customerSession(req);
+  if (!profile) return noCustomerSession(res);
   const id = Number(req.params.id);
-  const order = db.orders.find((o) => o.id === id);
-  if (order) {
-    order.cancelRequested = true;
-    order.cancelReason = req.body.reason;
+  const order = ordersForPhone(phoneDigits(profile.phone)).find((o) => o.id === id);
+  if (!order) {
+    return res.status(404).json({ error: 'not_found', message: 'Order not found' });
   }
-  res.json(order);
+  order.cancelRequested = true;
+  order.cancelReason = String(req.body?.reason ?? '') || order.cancelReason;
+  order.updatedAt = new Date().toISOString();
+  order.history.push({
+    fromStatus: order.status,
+    toStatus: order.status,
+    note: order.cancelReason || null,
+    actorType: 'CUSTOMER',
+    actor: profile.fullName || null,
+    at: order.updatedAt,
+  });
+  res.json(toOrderDetail(order));
 });
 
 // -------------------------------------------------------------
